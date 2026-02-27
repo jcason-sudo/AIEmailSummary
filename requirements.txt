@@ -1,0 +1,25 @@
+# InboxAI Dependencies
+
+# Web
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Email parsing
+pypff-python3>=20211114
+pywin32>=306; sys_platform == 'win32'
+
+# Vector store & embeddings  
+chromadb>=0.4.22,<0.6.0
+sentence-transformers>=2.2.2
+
+# HTTP (for Ollama API)
+httpx>=0.26.0
+
+# Text processing
+beautifulsoup4>=4.12.3
+html2text>=2024.2.26
+
+# Utilities
+python-dateutil>=2.8.2
+python-dotenv>=1.0.1
+tqdm>=4.66.2
