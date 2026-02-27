@@ -312,6 +312,137 @@ class RAGEngine:
         }
 
 
+    def prepare_for_meeting(self, meeting: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare a brief for a specific meeting by searching relevant emails.
+
+        Searches by:
+        1. Meeting subject (e.g., "Vodafone")
+        2. Attendee names/emails
+        3. "meeting summary" + subject (catches Zoom AI summaries)
+        """
+        subject = meeting.get('subject', '')
+        attendees = meeting.get('all_attendees', [])
+
+        all_emails = []
+        seen_ids = set()
+
+        def add_results(results):
+            for r in results:
+                rid = r.get('id', '')
+                if rid not in seen_ids:
+                    seen_ids.add(rid)
+                    all_emails.append(r)
+
+        # Search 1: by meeting subject
+        if subject:
+            results = self.vector_store.search(query=subject, n_results=10)
+            add_results(results)
+
+        # Search 2: by attendee names (top 3 to avoid too many queries)
+        for attendee in attendees[:3]:
+            if attendee:
+                results = self.vector_store.search(query=attendee, n_results=5)
+                add_results(results)
+
+        # Search 3: meeting summary + subject (catches Zoom AI summaries via email)
+        if subject:
+            results = self.vector_store.search(
+                query=f"meeting summary notes {subject}",
+                n_results=5
+            )
+            add_results(results)
+
+        # Expand with full thread context
+        emails_with_threads = self._expand_with_threads(all_emails)
+        logger.info(
+            f"Meeting prep for '{subject}': {len(all_emails)} unique emails, "
+            f"{len(emails_with_threads)} with threads"
+        )
+
+        # Generate prep brief
+        try:
+            brief = self.llm.generate_meeting_prep(meeting, emails_with_threads)
+        except Exception as e:
+            logger.error(f"Meeting prep LLM error: {e}")
+            brief = f"Error generating meeting prep: {e}"
+
+        return {
+            'meeting': {
+                'subject': subject,
+                'start': meeting.get('start', ''),
+                'end': meeting.get('end', ''),
+                'location': meeting.get('location', ''),
+                'organizer': meeting.get('organizer', ''),
+                'attendees': attendees,
+                'is_all_day': meeting.get('is_all_day', False),
+            },
+            'brief': brief,
+            'emails_found': len(all_emails),
+            'threads_found': len(set(
+                e.get('metadata', {}).get('conversation_id', '')
+                for e in emails_with_threads
+                if e.get('metadata', {}).get('conversation_id')
+            )),
+            'sources': [
+                {
+                    'sender': e.get('metadata', {}).get('sender_name') or e.get('metadata', {}).get('sender', ''),
+                    'subject': e.get('metadata', {}).get('subject', ''),
+                    'date': e.get('metadata', {}).get('date', ''),
+                }
+                for e in all_emails[:10]
+            ]
+        }
+
+    def prepare_for_meeting_stream(self, meeting: Dict[str, Any]):
+        """Stream a meeting prep brief."""
+        subject = meeting.get('subject', '')
+        attendees = meeting.get('all_attendees', [])
+
+        all_emails = []
+        seen_ids = set()
+
+        def add_results(results):
+            for r in results:
+                rid = r.get('id', '')
+                if rid not in seen_ids:
+                    seen_ids.add(rid)
+                    all_emails.append(r)
+
+        if subject:
+            add_results(self.vector_store.search(query=subject, n_results=10))
+        for attendee in attendees[:3]:
+            if attendee:
+                add_results(self.vector_store.search(query=attendee, n_results=5))
+        if subject:
+            add_results(self.vector_store.search(query=f"meeting summary notes {subject}", n_results=5))
+
+        emails_with_threads = self._expand_with_threads(all_emails)
+
+        # Stream the brief
+        for token in self.llm.generate_meeting_prep_stream(meeting, emails_with_threads):
+            yield {'type': 'chunk', 'content': token}
+
+        # Send metadata at end
+        yield {
+            'type': 'metadata',
+            'content': {
+                'emails_found': len(all_emails),
+                'sources': [
+                    {
+                        'sender': e.get('metadata', {}).get('sender_name') or e.get('metadata', {}).get('sender', ''),
+                        'subject': e.get('metadata', {}).get('subject', ''),
+                    }
+                    for e in all_emails[:10]
+                ]
+            }
+        }
+
+    def get_meetings(self) -> Dict[str, Any]:
+        """Get next business day meetings from Outlook Calendar."""
+        from calendar_connection import get_calendar_meetings
+        return get_calendar_meetings()
+
+
 _engine: Optional[RAGEngine] = None
 
 def get_rag_engine() -> RAGEngine:

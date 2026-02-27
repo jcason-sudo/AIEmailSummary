@@ -29,6 +29,14 @@ Your job is to:
 - Highlight deadlines mentioned in the emails
 - Summarize what the provided emails contain
 
+CONVERSATION THREADS:
+- Emails may be grouped into conversation threads showing the full back-and-forth
+- Each thread has a STATUS: NEEDS YOUR ACTION, AWAITING RESPONSE, or COMPLETED
+- "NEEDS YOUR ACTION" = the last message was received and you haven't replied
+- "AWAITING RESPONSE" = you sent the last message and are waiting for their reply
+- When asked about unanswered emails, use the thread status to determine this accurately
+- When asked about a topic (e.g. "Vodafone"), find ALL threads and standalone emails mentioning it and summarize the full conversation history
+
 Current date: {current_time}
 """
 
@@ -246,6 +254,116 @@ INSTRUCTIONS:
                     if token := data.get("response"):
                         yield token
                         
+    MEETING_PREP_PROMPT = """You are preparing a meeting brief. Based ONLY on the emails provided below, create a preparation summary.
+
+Meeting: {subject}
+Time: {start} - {end}
+Attendees: {attendees}
+Location: {location}
+
+Provide the following sections:
+
+1. **Background**: What is this about? Summarize the email history on this topic.
+2. **Key Topics**: Main discussion points from recent emails.
+3. **Open Items**: Unresolved questions or pending actions.
+4. **Recent Decisions**: Any decisions made in recent emails or meeting summaries.
+5. **Your Action Items**: Things you need to address or bring up in this meeting.
+6. **Meeting Notes Reference**: Any meeting summaries or notes found in the emails (e.g., Zoom meeting summaries).
+
+CRITICAL: ONLY use information from the provided emails. If no relevant emails exist for a section, say "No information found." Do NOT make anything up.
+
+Current date: {current_time}
+"""
+
+    def generate_meeting_prep(self,
+                              meeting: Dict[str, Any],
+                              email_context: List[Dict[str, Any]]) -> str:
+        """Generate a meeting preparation brief."""
+
+        attendees = ', '.join(meeting.get('all_attendees', [])[:10])
+        system = self.MEETING_PREP_PROMPT.format(
+            subject=meeting.get('subject', 'Unknown'),
+            start=meeting.get('start', ''),
+            end=meeting.get('end', ''),
+            attendees=attendees or 'Not specified',
+            location=meeting.get('location', 'Not specified'),
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+
+        if email_context:
+            context_str = self._format_email_context(email_context)
+            prompt = f"""Here are {len(email_context)} relevant emails and meeting summaries found for this meeting topic:
+
+===== START OF RELEVANT EMAILS =====
+{context_str}
+===== END OF RELEVANT EMAILS =====
+
+Please prepare the meeting brief based on these emails."""
+        else:
+            prompt = "No relevant emails were found for this meeting topic. Please indicate that no prior email context is available and suggest the attendee ask colleagues for background."
+
+        full_prompt = f"{system}\n\n{prompt}"
+
+        response = httpx.post(
+            f"{self.base_url}/api/generate",
+            json={
+                "model": self.model,
+                "prompt": full_prompt,
+                "stream": False,
+                "options": {"temperature": self.temperature}
+            },
+            timeout=120.0
+        )
+        response.raise_for_status()
+        return response.json()["response"]
+
+    def generate_meeting_prep_stream(self,
+                                     meeting: Dict[str, Any],
+                                     email_context: List[Dict[str, Any]]) -> Generator[str, None, None]:
+        """Stream a meeting preparation brief."""
+
+        attendees = ', '.join(meeting.get('all_attendees', [])[:10])
+        system = self.MEETING_PREP_PROMPT.format(
+            subject=meeting.get('subject', 'Unknown'),
+            start=meeting.get('start', ''),
+            end=meeting.get('end', ''),
+            attendees=attendees or 'Not specified',
+            location=meeting.get('location', 'Not specified'),
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+
+        if email_context:
+            context_str = self._format_email_context(email_context)
+            prompt = f"""Here are {len(email_context)} relevant emails and meeting summaries found for this meeting topic:
+
+===== START OF RELEVANT EMAILS =====
+{context_str}
+===== END OF RELEVANT EMAILS =====
+
+Please prepare the meeting brief based on these emails."""
+        else:
+            prompt = "No relevant emails were found for this meeting topic. Please indicate that no prior email context is available."
+
+        full_prompt = f"{system}\n\n{prompt}"
+
+        with httpx.stream(
+            "POST",
+            f"{self.base_url}/api/generate",
+            json={
+                "model": self.model,
+                "prompt": full_prompt,
+                "stream": True,
+                "options": {"temperature": self.temperature}
+            },
+            timeout=120.0
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    if token := data.get("response"):
+                        yield token
+
     def is_available(self) -> bool:
         """Check if Ollama is running."""
         try:

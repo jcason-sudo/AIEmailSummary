@@ -140,71 +140,85 @@ class EmailVectorStore:
         return emails
 
     def get_open_items(self) -> List[Dict[str, Any]]:
-        """Get unreplied inbound emails grouped by conversation thread."""
+        """Get open email threads by analyzing the last message in each conversation.
+
+        Thread status is determined by WHO sent the last message:
+        - Last message is RECEIVED + not replied → needs_action (you owe a reply)
+        - Last message is SENT → awaiting_response (they owe you a reply)
+        - Last message is RECEIVED + replied → completed
+
+        This does NOT rely on is_replied for sent emails (which is always False
+        since you don't reply to your own sent mail). Instead it looks at the
+        actual conversation timeline.
+        """
+        # Get ALL emails to build complete thread picture
         try:
+            total = self._collection.count()
+            if total == 0:
+                return []
             results = self._collection.get(
-                where={"$and": [{"direction": "received"}, {"is_replied": False}]},
-                include=["documents", "metadatas"],
-                limit=200
+                include=["metadatas"],
+                limit=min(total, 5000)
             )
         except Exception as e:
             logger.warning(f"Open items query failed: {e}")
             return []
 
         # Group by conversation_id
-        threads = {}
+        threads = {}  # conv_id -> list of metadata dicts
         standalone = []
         for i in range(len(results['ids'])):
             meta = results['metadatas'][i] if results['metadatas'] else {}
-            email = {
-                'id': results['ids'][i],
-                'document': results['documents'][i] if results['documents'] else '',
-                'metadata': meta
-            }
+            meta['_id'] = results['ids'][i]
             conv_id = meta.get('conversation_id', '')
             if conv_id:
-                threads.setdefault(conv_id, []).append(email)
+                threads.setdefault(conv_id, []).append(meta)
             else:
-                standalone.append(email)
+                # Standalone received + not replied = needs action
+                if meta.get('direction') == 'received' and not meta.get('is_replied'):
+                    standalone.append(meta)
 
-        # Build thread summaries
+        # Analyze each thread
         open_items = []
-        for conv_id, emails in threads.items():
-            # Get full thread context
-            full_thread = self.get_thread_emails(conv_id)
-            if not full_thread:
-                full_thread = emails
+        for conv_id, messages in threads.items():
+            # Sort by date to find the last message
+            messages.sort(key=lambda m: m.get('date', ''))
+            latest = messages[-1]
 
-            latest = max(full_thread, key=lambda e: e['metadata'].get('date', ''))
-            latest_meta = latest['metadata']
+            last_direction = latest.get('direction', 'received')
+            last_replied = latest.get('is_replied', False)
 
-            # Determine thread status
-            last_direction = latest_meta.get('direction', 'received')
-            last_replied = latest_meta.get('is_replied', False)
-
-            if last_direction == 'sent' and not last_replied:
-                status = 'awaiting_response'
-            elif last_direction == 'received' and not last_replied:
+            # Determine thread status based on who sent the last message
+            if last_direction == 'received' and not last_replied:
                 status = 'needs_action'
+            elif last_direction == 'sent':
+                # I sent the last message — check if anyone replied after
+                # (if my sent is the latest, they haven't responded)
+                status = 'awaiting_response'
+            elif last_direction == 'received' and last_replied:
+                status = 'completed'
             else:
                 status = 'completed'
 
+            # Skip completed threads
+            if status == 'completed':
+                continue
+
             open_items.append({
                 'conversation_id': conv_id,
-                'subject': latest_meta.get('subject', ''),
-                'sender': latest_meta.get('sender', ''),
-                'sender_name': latest_meta.get('sender_name', ''),
-                'date': latest_meta.get('date', ''),
-                'message_count': len(full_thread),
+                'subject': latest.get('subject', ''),
+                'sender': latest.get('sender', ''),
+                'sender_name': latest.get('sender_name', ''),
+                'date': latest.get('date', ''),
+                'message_count': len(messages),
                 'status': status,
                 'participants': list(set(
-                    e['metadata'].get('sender', '') for e in full_thread if e['metadata'].get('sender')
+                    m.get('sender', '') for m in messages if m.get('sender')
                 ))
             })
 
-        # Add standalone emails (no conversation_id)
-        for email in standalone:
-            meta = email['metadata']
+        # Add standalone emails (no conversation_id, received, not replied)
+        for meta in standalone:
             open_items.append({
                 'conversation_id': '',
                 'subject': meta.get('subject', ''),

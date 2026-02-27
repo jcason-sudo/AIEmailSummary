@@ -48,6 +48,15 @@ class InboxAI {
         this.tasksNeedsAction = document.getElementById('tasks-needs-action');
         this.tasksAwaitingResponse = document.getElementById('tasks-awaiting-response');
 
+        // Meetings
+        this.refreshMeetings = document.getElementById('refresh-meetings');
+        this.meetingsDate = document.getElementById('meetings-date');
+        this.meetingsList = document.getElementById('meetings-list');
+        this.meetingPrepContainer = document.getElementById('meeting-prep-container');
+        this.meetingPrepContent = document.getElementById('meeting-prep-content');
+        this.meetingPrepSources = document.getElementById('meeting-prep-sources');
+        this.prepMeetingTitle = document.getElementById('prep-meeting-title');
+
         // Settings
         this.llmBackend = document.getElementById('llm-backend');
         this.llmModel = document.getElementById('llm-model');
@@ -85,6 +94,9 @@ class InboxAI {
         // Tasks
         this.refreshTasks?.addEventListener('click', () => this.loadTasks());
 
+        // Meetings
+        this.refreshMeetings?.addEventListener('click', () => this.loadMeetings());
+
         // Settings
         this.llmBackend?.addEventListener('change', () => this.loadModels());
         this.llmTemperature?.addEventListener('input', () => {
@@ -117,6 +129,8 @@ class InboxAI {
             this.loadDashboard();
         } else if (viewName === 'tasks') {
             this.loadTasks();
+        } else if (viewName === 'meetings') {
+            this.loadMeetings();
         } else if (viewName === 'settings') {
             this.loadSettings();
         }
@@ -474,6 +488,137 @@ class InboxAI {
                 this.tasksAwaitingResponse.innerHTML =
                     '<div class="empty-placeholder">Error loading tasks</div>';
             }
+        }
+    }
+
+    // Meetings
+    async loadMeetings() {
+        try {
+            const response = await fetch(`${this.apiBase}/api/meetings`);
+            const data = await response.json();
+
+            if (data.error) {
+                this.meetingsList.innerHTML = `<div class="empty-placeholder">${this.escapeHtml(data.error)}</div>`;
+                return;
+            }
+
+            this.meetingsDate.textContent = data.date || '';
+
+            if (!data.meetings || data.meetings.length === 0) {
+                this.meetingsList.innerHTML = '<div class="empty-placeholder">No meetings scheduled</div>';
+                return;
+            }
+
+            this.meetingsList.innerHTML = data.meetings.map((m, i) => {
+                const startTime = m.start ? new Date(m.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                const endTime = m.end ? new Date(m.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                const attendeeCount = (m.all_attendees || []).length;
+                const attendeeList = (m.all_attendees || []).slice(0, 4).map(a => this.escapeHtml(a)).join(', ');
+                const moreAttendees = attendeeCount > 4 ? ` +${attendeeCount - 4} more` : '';
+
+                return `
+                    <div class="meeting-card">
+                        <div class="meeting-time">
+                            ${m.is_all_day ? '<span class="all-day-badge">All Day</span>' : `<span class="time-badge">${startTime} - ${endTime}</span>`}
+                            ${m.duration_minutes ? `<span class="duration">${m.duration_minutes}min</span>` : ''}
+                        </div>
+                        <div class="meeting-details">
+                            <div class="meeting-subject">${this.escapeHtml(m.subject || 'No Subject')}</div>
+                            ${m.location ? `<div class="meeting-location">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+                                    <circle cx="12" cy="10" r="3"/>
+                                </svg>
+                                ${this.escapeHtml(m.location)}
+                            </div>` : ''}
+                            ${m.organizer ? `<div class="meeting-organizer">Organizer: ${this.escapeHtml(m.organizer)}</div>` : ''}
+                            ${attendeeCount > 0 ? `<div class="meeting-attendees">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                                    <circle cx="9" cy="7" r="4"/>
+                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                                </svg>
+                                ${attendeeList}${moreAttendees}
+                            </div>` : ''}
+                        </div>
+                        <button class="btn-primary meeting-prep-btn" onclick="app.prepareMeeting(${i}, '${this.escapeHtml(m.subject || 'Meeting').replace(/'/g, "\\'")}')">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                                <line x1="16" y1="13" x2="8" y2="13"/>
+                                <line x1="16" y1="17" x2="8" y2="17"/>
+                            </svg>
+                            Prepare
+                        </button>
+                    </div>
+                `;
+            }).join('');
+
+        } catch (error) {
+            console.error('Meetings load error:', error);
+            this.meetingsList.innerHTML = '<div class="empty-placeholder">Error loading meetings</div>';
+        }
+    }
+
+    async prepareMeeting(index, title) {
+        this.meetingPrepContainer.style.display = 'block';
+        this.prepMeetingTitle.textContent = `Prep: ${title}`;
+        this.meetingPrepContent.innerHTML = '<div class="loading-placeholder">Generating prep brief...</div>';
+        this.meetingPrepSources.innerHTML = '';
+
+        // Scroll to prep container
+        this.meetingPrepContainer.scrollIntoView({ behavior: 'smooth' });
+
+        try {
+            const response = await fetch(`${this.apiBase}/api/meetings/${index}/prep?stream=true`);
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let fullContent = '';
+            let metadata = null;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value);
+                const lines = chunk.split('\n');
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6);
+                        if (data === '[DONE]') continue;
+
+                        try {
+                            const parsed = JSON.parse(data);
+                            if (parsed.type === 'chunk') {
+                                fullContent += parsed.content;
+                                this.meetingPrepContent.innerHTML = this.formatContent(fullContent);
+                            } else if (parsed.type === 'metadata') {
+                                metadata = parsed.content;
+                            }
+                        } catch (e) {
+                            // Ignore parse errors
+                        }
+                    }
+                }
+            }
+
+            // Show sources
+            if (metadata && metadata.sources && metadata.sources.length > 0) {
+                this.meetingPrepSources.innerHTML = `
+                    <div class="prep-sources-header">Based on ${metadata.emails_found || 0} emails</div>
+                    ${metadata.sources.map(s => `
+                        <span class="source-tag">
+                            ${this.escapeHtml(s.sender || 'Unknown')} — ${this.escapeHtml(s.subject || '')}
+                        </span>
+                    `).join('')}
+                `;
+            }
+
+        } catch (error) {
+            console.error('Meeting prep error:', error);
+            this.meetingPrepContent.innerHTML = '<div class="empty-placeholder">Error generating meeting prep. Check that the LLM is running.</div>';
         }
     }
 

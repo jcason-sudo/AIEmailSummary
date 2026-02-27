@@ -147,6 +147,37 @@ def tasks():
     return jsonify(rag.get_tasks())
 
 
+@app.route('/api/meetings')
+def meetings():
+    """Get next business day meetings from Outlook Calendar."""
+    rag = get_rag_engine()
+    return jsonify(rag.get_meetings())
+
+
+@app.route('/api/meetings/<int:index>/prep')
+def meeting_prep(index):
+    """Get AI-generated meeting prep brief for a specific meeting."""
+    rag = get_rag_engine()
+    meetings_data = rag.get_meetings()
+    meeting_list = meetings_data.get('meetings', [])
+
+    if index < 0 or index >= len(meeting_list):
+        return jsonify({'error': 'Meeting not found'}), 404
+
+    meeting = meeting_list[index]
+
+    # Check if streaming requested
+    if request.args.get('stream'):
+        def generate():
+            for item in rag.prepare_for_meeting_stream(meeting):
+                yield f"data: {json.dumps(item)}\n\n"
+            yield "data: [DONE]\n\n"
+        return Response(generate(), mimetype='text/event-stream')
+    else:
+        result = rag.prepare_for_meeting(meeting)
+        return jsonify(result)
+
+
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
     """Get current settings."""
