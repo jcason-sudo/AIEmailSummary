@@ -212,14 +212,21 @@ def update_settings():
     updated = []
 
     backend = data.get('backend', 'local')
-    llm = get_llm_client(backend)
 
     if 'temperature' in data:
-        llm.set_temperature(float(data['temperature']))
+        # Apply temperature to both backends so it persists across switches
+        temp = float(data['temperature'])
+        get_ollama_client().set_temperature(temp)
+        try:
+            get_llm_client('claude').set_temperature(temp)
+        except ValueError:
+            pass  # Claude not configured
         updated.append('temperature')
 
     if 'model' in data:
-        llm.set_model(data['model'])
+        # Only apply model to the local backend — Claude model is fixed via config
+        if backend == 'local':
+            get_ollama_client().set_model(data['model'])
         updated.append('model')
 
     if 'backend' in data:
