@@ -149,9 +149,10 @@ def tasks():
 
 @app.route('/api/meetings')
 def meetings():
-    """Get next business day meetings from Outlook Calendar."""
+    """Get upcoming meetings from Outlook Calendar."""
+    days = request.args.get('days', 7, type=int)
     rag = get_rag_engine()
-    return jsonify(rag.get_meetings())
+    return jsonify(rag.get_meetings(days=days))
 
 
 @app.route('/api/meetings/<int:index>/prep')
@@ -184,7 +185,7 @@ def get_settings():
     llm = get_ollama_client()
     return jsonify({
         'llm': {
-            'backend': 'ollama',
+            'backend': 'llamacpp-vulkan',
             'model': llm.model,
             'temperature': llm.temperature
         },

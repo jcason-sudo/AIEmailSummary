@@ -494,7 +494,7 @@ class InboxAI {
     // Meetings
     async loadMeetings() {
         try {
-            const response = await fetch(`${this.apiBase}/api/meetings`);
+            const response = await fetch(`${this.apiBase}/api/meetings?days=7`);
             const data = await response.json();
 
             if (data.error) {
@@ -502,58 +502,85 @@ class InboxAI {
                 return;
             }
 
-            this.meetingsDate.textContent = data.date || '';
+            this.meetingsDate.textContent = data.start_date && data.end_date
+                ? `${data.start_date} — ${data.end_date} (${data.meeting_count} meetings)`
+                : '';
 
             if (!data.meetings || data.meetings.length === 0) {
-                this.meetingsList.innerHTML = '<div class="empty-placeholder">No meetings scheduled</div>';
+                this.meetingsList.innerHTML = '<div class="empty-placeholder">No meetings scheduled in the next 7 days</div>';
                 return;
             }
 
-            this.meetingsList.innerHTML = data.meetings.map((m, i) => {
-                const startTime = m.start ? new Date(m.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-                const endTime = m.end ? new Date(m.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-                const attendeeCount = (m.all_attendees || []).length;
-                const attendeeList = (m.all_attendees || []).slice(0, 4).map(a => this.escapeHtml(a)).join(', ');
-                const moreAttendees = attendeeCount > 4 ? ` +${attendeeCount - 4} more` : '';
+            // Render grouped by date
+            const byDate = data.by_date || {};
+            const sortedDates = Object.keys(byDate).sort();
 
-                return `
-                    <div class="meeting-card">
-                        <div class="meeting-time">
-                            ${m.is_all_day ? '<span class="all-day-badge">All Day</span>' : `<span class="time-badge">${startTime} - ${endTime}</span>`}
-                            ${m.duration_minutes ? `<span class="duration">${m.duration_minutes}min</span>` : ''}
-                        </div>
-                        <div class="meeting-details">
-                            <div class="meeting-subject">${this.escapeHtml(m.subject || 'No Subject')}</div>
-                            ${m.location ? `<div class="meeting-location">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
-                                    <circle cx="12" cy="10" r="3"/>
+            let html = '';
+            let globalIndex = 0;
+            // Build a flat index map so prep button uses correct global index
+            const indexMap = {};
+            data.meetings.forEach((m, i) => { indexMap[JSON.stringify(m)] = i; });
+
+            for (const dateKey of sortedDates) {
+                const dayMeetings = byDate[dateKey];
+                const dateObj = new Date(dateKey + 'T00:00:00');
+                const dayLabel = dateObj.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' });
+
+                html += `<div class="meetings-day-header">${dayLabel}</div>`;
+
+                for (const m of dayMeetings) {
+                    // Find global index for this meeting in the flat meetings array
+                    const idx = data.meetings.findIndex(dm =>
+                        dm.subject === m.subject && dm.start === m.start);
+
+                    const startTime = m.start ? new Date(m.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                    const endTime = m.end ? new Date(m.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                    const attendeeCount = (m.all_attendees || []).length;
+                    const attendeeList = (m.all_attendees || []).slice(0, 4).map(a => this.escapeHtml(a)).join(', ');
+                    const moreAttendees = attendeeCount > 4 ? ` +${attendeeCount - 4} more` : '';
+                    const recurringBadge = m.is_recurring ? '<span class="recurring-badge">Recurring</span>' : '';
+
+                    html += `
+                        <div class="meeting-card">
+                            <div class="meeting-time">
+                                ${m.is_all_day ? '<span class="all-day-badge">All Day</span>' : `<span class="time-badge">${startTime} - ${endTime}</span>`}
+                                ${m.duration_minutes ? `<span class="duration">${m.duration_minutes}min</span>` : ''}
+                            </div>
+                            <div class="meeting-details">
+                                <div class="meeting-subject">${this.escapeHtml(m.subject || 'No Subject')} ${recurringBadge}</div>
+                                ${m.location ? `<div class="meeting-location">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+                                        <circle cx="12" cy="10" r="3"/>
+                                    </svg>
+                                    ${this.escapeHtml(m.location)}
+                                </div>` : ''}
+                                ${m.organizer ? `<div class="meeting-organizer">Organizer: ${this.escapeHtml(m.organizer)}</div>` : ''}
+                                ${attendeeCount > 0 ? `<div class="meeting-attendees">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                                        <circle cx="9" cy="7" r="4"/>
+                                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                                        <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                                    </svg>
+                                    ${attendeeList}${moreAttendees}
+                                </div>` : ''}
+                            </div>
+                            <button class="btn-primary meeting-prep-btn" onclick="app.prepareMeeting(${idx}, '${this.escapeHtml(m.subject || 'Meeting').replace(/'/g, "\\'")}')">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                    <polyline points="14 2 14 8 20 8"/>
+                                    <line x1="16" y1="13" x2="8" y2="13"/>
+                                    <line x1="16" y1="17" x2="8" y2="17"/>
                                 </svg>
-                                ${this.escapeHtml(m.location)}
-                            </div>` : ''}
-                            ${m.organizer ? `<div class="meeting-organizer">Organizer: ${this.escapeHtml(m.organizer)}</div>` : ''}
-                            ${attendeeCount > 0 ? `<div class="meeting-attendees">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                                    <circle cx="9" cy="7" r="4"/>
-                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                                </svg>
-                                ${attendeeList}${moreAttendees}
-                            </div>` : ''}
+                                Prepare
+                            </button>
                         </div>
-                        <button class="btn-primary meeting-prep-btn" onclick="app.prepareMeeting(${i}, '${this.escapeHtml(m.subject || 'Meeting').replace(/'/g, "\\'")}')">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                                <polyline points="14 2 14 8 20 8"/>
-                                <line x1="16" y1="13" x2="8" y2="13"/>
-                                <line x1="16" y1="17" x2="8" y2="17"/>
-                            </svg>
-                            Prepare
-                        </button>
-                    </div>
-                `;
-            }).join('');
+                    `;
+                }
+            }
+
+            this.meetingsList.innerHTML = html;
 
         } catch (error) {
             console.error('Meetings load error:', error);

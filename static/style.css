@@ -1057,6 +1057,34 @@ body {
     white-space: nowrap;
 }
 
+.meetings-day-header {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    padding: var(--space-md) 0 var(--space-sm) 0;
+    border-bottom: 1px solid var(--color-border-subtle);
+    margin-bottom: var(--space-sm);
+    margin-top: var(--space-md);
+}
+
+.meetings-day-header:first-child {
+    margin-top: 0;
+}
+
+.recurring-badge {
+    display: inline-block;
+    background: var(--color-info-soft);
+    color: var(--color-info);
+    font-size: 0.65rem;
+    padding: 1px 6px;
+    border-radius: 6px;
+    margin-left: 6px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    vertical-align: middle;
+}
+
 /* Meeting Prep Container */
 .meeting-prep-container {
     margin-top: var(--space-xl);

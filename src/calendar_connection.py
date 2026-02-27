@@ -241,17 +241,51 @@ class CalendarConnection:
             'meetings': meetings,
         }
 
+    def get_upcoming_meetings(self, days: int = 7) -> dict:
+        """Get meetings for the next N days including recurring meetings.
 
-def get_calendar_meetings() -> dict:
-    """Convenience function to get next business day meetings."""
+        IncludeRecurrences is already set in get_meetings(), so recurring
+        meetings created long ago will appear as expanded occurrences within
+        the date range.
+        """
+        today = datetime.now()
+        start = today.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        end = start + timedelta(days=days)
+
+        meetings = self.get_meetings(start, end)
+
+        # Group by date for easier frontend display
+        by_date = {}
+        for m in meetings:
+            if m['start']:
+                date_key = m['start'][:10]  # YYYY-MM-DD
+            else:
+                date_key = 'unknown'
+            by_date.setdefault(date_key, []).append(m)
+
+        return {
+            'start_date': start.strftime('%A, %B %d, %Y'),
+            'end_date': (end - timedelta(days=1)).strftime('%A, %B %d, %Y'),
+            'start_iso': start.isoformat(),
+            'end_iso': end.isoformat(),
+            'days': days,
+            'meeting_count': len(meetings),
+            'meetings': meetings,
+            'by_date': by_date,
+        }
+
+
+def get_calendar_meetings(days: int = 7) -> dict:
+    """Convenience function to get upcoming meetings."""
     if not CALENDAR_AVAILABLE:
         return {
-            'date': '',
-            'date_iso': '',
+            'start_date': '',
+            'end_date': '',
             'meeting_count': 0,
             'meetings': [],
+            'by_date': {},
             'error': 'Calendar not available (Windows + Outlook required)'
         }
 
     with CalendarConnection() as conn:
-        return conn.get_next_business_day_meetings()
+        return conn.get_upcoming_meetings(days=days)

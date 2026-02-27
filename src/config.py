@@ -8,9 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Ollama
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+# llama.cpp server (Vulkan GPU)
+LLAMACPP_URL = os.getenv("LLAMACPP_URL", "http://localhost:8080")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama-3.2-3b-instruct")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 
 # Database

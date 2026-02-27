@@ -1,5 +1,5 @@
 """
-LLM client - Ollama only. Direct HTTP, no wrappers.
+LLM client - llama.cpp server via OpenAI-compatible API (Vulkan GPU).
 """
 
 import logging
@@ -11,9 +11,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-class OllamaClient:
-    """Direct Ollama API client."""
-    
+class LlamaCppClient:
+    """llama.cpp server client using OpenAI-compatible API."""
+
     SYSTEM_PROMPT = """You are an email assistant that ONLY analyzes emails shown to you.
 
 CRITICAL RULES:
@@ -41,8 +41,8 @@ Current date: {current_time}
 """
 
     def __init__(self,
-                 base_url: str = "http://localhost:11434",
-                 model: str = "llama3.1:8b",
+                 base_url: str = "http://localhost:8080",
+                 model: str = "llama-3.2-3b-instruct",
                  temperature: float = 0.3):
         self.base_url = base_url.rstrip('/')
         self.model = model
@@ -88,7 +88,6 @@ CONTENT:
         if not emails:
             return "No relevant emails found in the database."
 
-        # Group emails by conversation_id for thread display
         threads = {}
         standalone = []
         for email in emails:
@@ -101,12 +100,9 @@ CONTENT:
         parts = []
         idx = 1
 
-        # Render threaded conversations
         for conv_id, thread_emails in threads.items():
-            # Sort thread by date
             thread_emails.sort(key=lambda e: e.get('metadata', {}).get('date', ''))
 
-            # Determine thread status
             latest = thread_emails[-1]
             latest_meta = latest.get('metadata', {})
             last_dir = latest_meta.get('direction', 'received')
@@ -132,7 +128,6 @@ Thread Status: {thread_status} | Messages: {len(thread_emails)}
 {self._format_single_email(email, idx)}""")
                 idx += 1
 
-        # Render standalone emails
         for email in standalone:
             parts.append(f"""
 ================================================================================
@@ -144,24 +139,15 @@ EMAIL #{idx} (standalone)
         result = "\n".join(parts)
         logger.info(f"Formatted context: {idx - 1} emails ({len(threads)} threads + {len(standalone)} standalone), {len(result)} total chars")
         return result
-        
-    def chat(self,
-             user_message: str,
-             email_context: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Send message, get response."""
-        
-        system = self.SYSTEM_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
-        )
-        
+
+    def _build_prompt(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None) -> str:
+        """Build the user prompt from message and email context."""
         if email_context:
             context_str = self._format_email_context(email_context)
             logger.info(f"Sending {len(email_context)} emails to LLM ({len(context_str)} chars)")
-            
-            # Debug: print first 500 chars of context
             logger.debug(f"Context preview:\n{context_str[:500]}")
-            
-            prompt = f"""I am providing you with {len(email_context)} emails from the user's inbox below.
+
+            return f"""I am providing you with {len(email_context)} emails from the user's inbox below.
 ONLY use information from these emails to answer the question. Do NOT make up any information.
 
 ===== START OF EMAILS FROM INBOX =====
@@ -177,83 +163,64 @@ INSTRUCTIONS:
 - Be specific and quote from the actual email content when possible"""
         else:
             logger.warning("No email context provided to LLM")
-            prompt = f"""No emails were found in the database for this query.
+            return f"""No emails were found in the database for this query.
 
 User asked: {user_message}
 
 Please let the user know that no relevant emails were found and suggest they may need to ingest emails first."""
-        
-        # Combine system + user into single prompt for /api/generate
-        full_prompt = f"{system}\n\n{prompt}"
-        
-        logger.debug(f"Prompt length: {len(full_prompt)} chars")
-        
-        # Use /api/generate endpoint (more compatible across Ollama versions)
-        response = httpx.post(
-            f"{self.base_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": full_prompt,
-                "stream": False,
-                "options": {"temperature": self.temperature}
-            },
-            timeout=120.0
+
+    def _call_api(self, system: str, prompt: str, stream: bool = False):
+        """Make a request to llama.cpp OpenAI-compatible API."""
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": self.temperature,
+            "stream": stream
+        }
+        if stream:
+            return httpx.stream("POST", f"{self.base_url}/v1/chat/completions",
+                                json=payload, timeout=300.0)
+        else:
+            response = httpx.post(f"{self.base_url}/v1/chat/completions",
+                                  json=payload, timeout=300.0)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+
+    def _stream_tokens(self, system: str, prompt: str) -> Generator[str, None, None]:
+        """Stream tokens from llama.cpp server."""
+        with self._call_api(system, prompt, stream=True) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    data = json.loads(line[6:])
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    if token := delta.get("content"):
+                        yield token
+
+    def chat(self,
+             user_message: str,
+             email_context: Optional[List[Dict[str, Any]]] = None) -> str:
+        """Send message, get response."""
+        system = self.SYSTEM_PROMPT.format(
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
         )
-        response.raise_for_status()
-        return response.json()["response"]
-    
+        prompt = self._build_prompt(user_message, email_context)
+        logger.debug(f"Prompt length: {len(prompt)} chars")
+        return self._call_api(system, prompt)
+
     def chat_stream(self,
                     user_message: str,
                     email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
         """Stream response chunks."""
-        
         system = self.SYSTEM_PROMPT.format(
             current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
         )
-        
-        if email_context:
-            context_str = self._format_email_context(email_context)
-            logger.info(f"Streaming with {len(email_context)} emails ({len(context_str)} chars)")
-            prompt = f"""I am providing you with {len(email_context)} emails from the user's inbox below.
-ONLY use information from these emails to answer the question. Do NOT make up any information.
+        prompt = self._build_prompt(user_message, email_context)
+        yield from self._stream_tokens(system, prompt)
 
-===== START OF EMAILS FROM INBOX =====
-{context_str}
-===== END OF EMAILS FROM INBOX =====
-
-USER'S QUESTION: {user_message}
-
-INSTRUCTIONS:
-- Answer based ONLY on the emails shown above
-- Reference specific senders and subjects from the emails
-- If no emails are relevant, say "I don't see any emails about that in the results"
-- Be specific and quote from the actual email content when possible"""
-        else:
-            logger.warning("No email context for streaming")
-            prompt = user_message
-        
-        # Combine system + user into single prompt
-        full_prompt = f"{system}\n\n{prompt}"
-        
-        # Use /api/generate endpoint for streaming
-        with httpx.stream(
-            "POST",
-            f"{self.base_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": full_prompt,
-                "stream": True,
-                "options": {"temperature": self.temperature}
-            },
-            timeout=120.0
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if line:
-                    data = json.loads(line)
-                    if token := data.get("response"):
-                        yield token
-                        
     MEETING_PREP_PROMPT = """You are preparing a meeting brief. Based ONLY on the emails provided below, create a preparation summary.
 
 Meeting: {subject}
@@ -275,11 +242,8 @@ CRITICAL: ONLY use information from the provided emails. If no relevant emails e
 Current date: {current_time}
 """
 
-    def generate_meeting_prep(self,
-                              meeting: Dict[str, Any],
-                              email_context: List[Dict[str, Any]]) -> str:
-        """Generate a meeting preparation brief."""
-
+    def _build_meeting_context(self, meeting: Dict[str, Any], email_context: List[Dict[str, Any]]):
+        """Build system prompt and user prompt for meeting prep."""
         attendees = ', '.join(meeting.get('all_attendees', [])[:10])
         system = self.MEETING_PREP_PROMPT.format(
             subject=meeting.get('subject', 'Unknown'),
@@ -302,95 +266,50 @@ Please prepare the meeting brief based on these emails."""
         else:
             prompt = "No relevant emails were found for this meeting topic. Please indicate that no prior email context is available and suggest the attendee ask colleagues for background."
 
-        full_prompt = f"{system}\n\n{prompt}"
+        return system, prompt
 
-        response = httpx.post(
-            f"{self.base_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": full_prompt,
-                "stream": False,
-                "options": {"temperature": self.temperature}
-            },
-            timeout=120.0
-        )
-        response.raise_for_status()
-        return response.json()["response"]
+    def generate_meeting_prep(self,
+                              meeting: Dict[str, Any],
+                              email_context: List[Dict[str, Any]]) -> str:
+        """Generate a meeting preparation brief."""
+        system, prompt = self._build_meeting_context(meeting, email_context)
+        return self._call_api(system, prompt)
 
     def generate_meeting_prep_stream(self,
                                      meeting: Dict[str, Any],
                                      email_context: List[Dict[str, Any]]) -> Generator[str, None, None]:
         """Stream a meeting preparation brief."""
-
-        attendees = ', '.join(meeting.get('all_attendees', [])[:10])
-        system = self.MEETING_PREP_PROMPT.format(
-            subject=meeting.get('subject', 'Unknown'),
-            start=meeting.get('start', ''),
-            end=meeting.get('end', ''),
-            attendees=attendees or 'Not specified',
-            location=meeting.get('location', 'Not specified'),
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        )
-
-        if email_context:
-            context_str = self._format_email_context(email_context)
-            prompt = f"""Here are {len(email_context)} relevant emails and meeting summaries found for this meeting topic:
-
-===== START OF RELEVANT EMAILS =====
-{context_str}
-===== END OF RELEVANT EMAILS =====
-
-Please prepare the meeting brief based on these emails."""
-        else:
-            prompt = "No relevant emails were found for this meeting topic. Please indicate that no prior email context is available."
-
-        full_prompt = f"{system}\n\n{prompt}"
-
-        with httpx.stream(
-            "POST",
-            f"{self.base_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": full_prompt,
-                "stream": True,
-                "options": {"temperature": self.temperature}
-            },
-            timeout=120.0
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if line:
-                    data = json.loads(line)
-                    if token := data.get("response"):
-                        yield token
+        system, prompt = self._build_meeting_context(meeting, email_context)
+        yield from self._stream_tokens(system, prompt)
 
     def is_available(self) -> bool:
-        """Check if Ollama is running."""
+        """Check if llama.cpp server is running."""
         try:
-            r = httpx.get(f"{self.base_url}/api/tags", timeout=5.0)
+            r = httpx.get(f"{self.base_url}/health", timeout=5.0)
             return r.status_code == 200
         except:
             return False
-            
+
     def list_models(self) -> List[str]:
         """Get available models."""
         try:
-            r = httpx.get(f"{self.base_url}/api/tags", timeout=10.0)
+            r = httpx.get(f"{self.base_url}/v1/models", timeout=10.0)
             if r.status_code == 200:
-                return [m["name"] for m in r.json().get("models", [])]
+                return [m["id"] for m in r.json().get("data", [])]
         except:
             pass
         return []
 
 
-_client: Optional[OllamaClient] = None
+# Keep the same function name so the rest of the app doesn't need changes
+_client: Optional[LlamaCppClient] = None
 
-def get_ollama_client() -> OllamaClient:
+def get_ollama_client() -> LlamaCppClient:
     global _client
     if _client is None:
         import config
-        _client = OllamaClient(
-            base_url=config.OLLAMA_URL,
+        _client = LlamaCppClient(
+            base_url=config.LLAMACPP_URL,
             model=config.OLLAMA_MODEL,
             temperature=config.LLM_TEMPERATURE
         )

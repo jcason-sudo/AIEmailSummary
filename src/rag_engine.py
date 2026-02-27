@@ -437,10 +437,10 @@ class RAGEngine:
             }
         }
 
-    def get_meetings(self) -> Dict[str, Any]:
-        """Get next business day meetings from Outlook Calendar."""
+    def get_meetings(self, days: int = 7) -> Dict[str, Any]:
+        """Get upcoming meetings from Outlook Calendar."""
         from calendar_connection import get_calendar_meetings
-        return get_calendar_meetings()
+        return get_calendar_meetings(days=days)
 
 
 _engine: Optional[RAGEngine] = None
