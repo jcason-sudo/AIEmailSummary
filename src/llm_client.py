@@ -1,5 +1,5 @@
 """
-LLM client - llama.cpp server via OpenAI-compatible API (Vulkan GPU).
+LLM client - supports llama.cpp (local GPU) and Claude API (cloud).
 """
 
 import logging
@@ -11,8 +11,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-class LlamaCppClient:
-    """llama.cpp server client using OpenAI-compatible API."""
+class BaseLLMClient:
+    """Shared logic for all LLM backends."""
 
     SYSTEM_PROMPT = """You are an email assistant that ONLY analyzes emails shown to you.
 
@@ -40,23 +40,34 @@ CONVERSATION THREADS:
 Current date: {current_time}
 """
 
-    def __init__(self,
-                 base_url: str = "http://localhost:8080",
-                 model: str = "llama-3.2-3b-instruct",
-                 temperature: float = 0.3):
-        self.base_url = base_url.rstrip('/')
-        self.model = model
+    MEETING_PREP_PROMPT = """You are preparing a meeting brief. Based ONLY on the emails provided below, create a preparation summary.
+
+Meeting: {subject}
+Time: {start} - {end}
+Attendees: {attendees}
+Location: {location}
+
+Provide the following sections:
+
+1. **Background**: What is this about? Summarize the email history on this topic.
+2. **Key Topics**: Main discussion points from recent emails.
+3. **Open Items**: Unresolved questions or pending actions.
+4. **Recent Decisions**: Any decisions made in recent emails or meeting summaries.
+5. **Your Action Items**: Things you need to address or bring up in this meeting.
+6. **Meeting Notes Reference**: Any meeting summaries or notes found in the emails (e.g., Zoom meeting summaries).
+
+CRITICAL: ONLY use information from the provided emails. If no relevant emails exist for a section, say "No information found." Do NOT make anything up.
+
+Current date: {current_time}
+"""
+
+    def __init__(self, temperature: float = 0.3):
         self.temperature = temperature
 
     def set_temperature(self, temperature: float):
         """Update temperature at runtime."""
         self.temperature = max(0.0, min(1.0, temperature))
         logger.info(f"Temperature updated to {self.temperature}")
-
-    def set_model(self, model: str):
-        """Update model at runtime."""
-        self.model = model
-        logger.info(f"Model updated to {self.model}")
 
     def _format_single_email(self, email: Dict[str, Any], index: int) -> str:
         """Format a single email for LLM context."""
@@ -81,8 +92,8 @@ Date: {date}
 Status: {is_read} | Replied: {is_replied}
 
 CONTENT:
-{content[:2500]}
-{"[...truncated...]" if len(content) > 2500 else ""}"""
+{content[:1000]}
+{"[...truncated...]" if len(content) > 1000 else ""}"""
 
     def _format_email_context(self, emails: List[Dict[str, Any]]) -> str:
         if not emails:
@@ -169,79 +180,6 @@ User asked: {user_message}
 
 Please let the user know that no relevant emails were found and suggest they may need to ingest emails first."""
 
-    def _call_api(self, system: str, prompt: str, stream: bool = False):
-        """Make a request to llama.cpp OpenAI-compatible API."""
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": self.temperature,
-            "stream": stream
-        }
-        if stream:
-            return httpx.stream("POST", f"{self.base_url}/v1/chat/completions",
-                                json=payload, timeout=300.0)
-        else:
-            response = httpx.post(f"{self.base_url}/v1/chat/completions",
-                                  json=payload, timeout=300.0)
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-
-    def _stream_tokens(self, system: str, prompt: str) -> Generator[str, None, None]:
-        """Stream tokens from llama.cpp server."""
-        with self._call_api(system, prompt, stream=True) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if line.startswith("data: ") and line != "data: [DONE]":
-                    data = json.loads(line[6:])
-                    delta = data.get("choices", [{}])[0].get("delta", {})
-                    if token := delta.get("content"):
-                        yield token
-
-    def chat(self,
-             user_message: str,
-             email_context: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Send message, get response."""
-        system = self.SYSTEM_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
-        )
-        prompt = self._build_prompt(user_message, email_context)
-        logger.debug(f"Prompt length: {len(prompt)} chars")
-        return self._call_api(system, prompt)
-
-    def chat_stream(self,
-                    user_message: str,
-                    email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
-        """Stream response chunks."""
-        system = self.SYSTEM_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
-        )
-        prompt = self._build_prompt(user_message, email_context)
-        yield from self._stream_tokens(system, prompt)
-
-    MEETING_PREP_PROMPT = """You are preparing a meeting brief. Based ONLY on the emails provided below, create a preparation summary.
-
-Meeting: {subject}
-Time: {start} - {end}
-Attendees: {attendees}
-Location: {location}
-
-Provide the following sections:
-
-1. **Background**: What is this about? Summarize the email history on this topic.
-2. **Key Topics**: Main discussion points from recent emails.
-3. **Open Items**: Unresolved questions or pending actions.
-4. **Recent Decisions**: Any decisions made in recent emails or meeting summaries.
-5. **Your Action Items**: Things you need to address or bring up in this meeting.
-6. **Meeting Notes Reference**: Any meeting summaries or notes found in the emails (e.g., Zoom meeting summaries).
-
-CRITICAL: ONLY use information from the provided emails. If no relevant emails exist for a section, say "No information found." Do NOT make anything up.
-
-Current date: {current_time}
-"""
-
     def _build_meeting_context(self, meeting: Dict[str, Any], email_context: List[Dict[str, Any]]):
         """Build system prompt and user prompt for meeting prep."""
         attendees = ', '.join(meeting.get('all_attendees', [])[:10])
@@ -268,19 +206,179 @@ Please prepare the meeting brief based on these emails."""
 
         return system, prompt
 
+    # Public interface - subclasses must implement these
+    def chat(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None) -> str:
+        raise NotImplementedError
+
+    def chat_stream(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
+        raise NotImplementedError
+
+    def generate_meeting_prep(self, meeting: Dict[str, Any], email_context: List[Dict[str, Any]]) -> str:
+        raise NotImplementedError
+
+    def generate_meeting_prep_stream(self, meeting: Dict[str, Any], email_context: List[Dict[str, Any]]) -> Generator[str, None, None]:
+        raise NotImplementedError
+
+    def is_available(self) -> bool:
+        raise NotImplementedError
+
+    def list_models(self) -> List[str]:
+        raise NotImplementedError
+
+
+class LlamaCppClient(BaseLLMClient):
+    """llama.cpp server client using OpenAI-compatible API."""
+
+    def __init__(self,
+                 base_url: str = "http://localhost:8080",
+                 model: str = "llama-3.2-3b-instruct",
+                 temperature: float = 0.3):
+        super().__init__(temperature)
+        self.base_url = base_url.rstrip('/')
+        self.model = model
+
+    def set_model(self, model: str):
+        """Update model at runtime."""
+        self.model = model
+        logger.info(f"Model updated to {self.model}")
+
+    def _call_api(self, system: str, prompt: str, stream: bool = False):
+        """Make a request to llama.cpp OpenAI-compatible API."""
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": self.temperature,
+            "max_tokens": 1024,
+            "stream": stream
+        }
+        if stream:
+            return httpx.stream("POST", f"{self.base_url}/v1/chat/completions",
+                                json=payload, timeout=300.0)
+        else:
+            response = httpx.post(f"{self.base_url}/v1/chat/completions",
+                                  json=payload, timeout=300.0)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+
+    def _call_api_with_retry(self, system: str, prompt: str, email_context: Optional[List[Dict[str, Any]]] = None, stream: bool = False):
+        """Call API with graceful context overflow retry.
+
+        If the local LLM returns a 400 (context too long), retry with progressively
+        fewer emails by removing the oldest ones first.
+        """
+        try:
+            return self._call_api(system, prompt, stream=stream)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 400 or email_context is None:
+                raise
+
+            # Context overflow — retry with fewer emails
+            logger.warning(f"Context overflow (400) with {len(email_context)} emails, retrying with fewer")
+            remaining = email_context.copy()
+
+            for attempt in range(3):
+                # Remove ~1/3 of remaining emails (oldest first by date)
+                cut = max(1, len(remaining) // 3)
+                remaining.sort(key=lambda e: e.get('metadata', {}).get('date', ''))
+                remaining = remaining[cut:]
+                logger.info(f"Retry {attempt + 1}: reduced to {len(remaining)} emails")
+
+                new_prompt = self._build_prompt(
+                    prompt.split("USER'S QUESTION: ")[-1].split("\n\nINSTRUCTIONS:")[0] if "USER'S QUESTION:" in prompt else prompt,
+                    remaining
+                )
+
+                try:
+                    return self._call_api(system, new_prompt, stream=stream)
+                except httpx.HTTPStatusError as e2:
+                    if e2.response.status_code != 400:
+                        raise
+                    continue
+
+            raise RuntimeError("Context too long even after reducing to minimum emails")
+
+    def _stream_tokens(self, system: str, prompt: str) -> Generator[str, None, None]:
+        """Stream tokens from llama.cpp server."""
+        with self._call_api(system, prompt, stream=True) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    data = json.loads(line[6:])
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    if token := delta.get("content"):
+                        yield token
+
+    def _stream_tokens_with_retry(self, system: str, prompt: str, email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
+        """Stream tokens with graceful context overflow retry."""
+        try:
+            yield from self._stream_tokens(system, prompt)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 400 or email_context is None:
+                raise
+
+            logger.warning(f"Context overflow (400) during streaming with {len(email_context)} emails, retrying with fewer")
+            remaining = email_context.copy()
+
+            for attempt in range(3):
+                cut = max(1, len(remaining) // 3)
+                remaining.sort(key=lambda e: e.get('metadata', {}).get('date', ''))
+                remaining = remaining[cut:]
+                logger.info(f"Stream retry {attempt + 1}: reduced to {len(remaining)} emails")
+
+                # Extract original user question from prompt
+                if "USER'S QUESTION:" in prompt:
+                    user_msg = prompt.split("USER'S QUESTION: ")[-1].split("\n\nINSTRUCTIONS:")[0]
+                else:
+                    user_msg = prompt
+                new_prompt = self._build_prompt(user_msg, remaining)
+
+                try:
+                    yield from self._stream_tokens(system, new_prompt)
+                    return
+                except httpx.HTTPStatusError as e2:
+                    if e2.response.status_code != 400:
+                        raise
+                    continue
+
+            raise RuntimeError("Context too long even after reducing to minimum emails")
+
+    def chat(self,
+             user_message: str,
+             email_context: Optional[List[Dict[str, Any]]] = None) -> str:
+        """Send message, get response."""
+        system = self.SYSTEM_PROMPT.format(
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+        )
+        prompt = self._build_prompt(user_message, email_context)
+        logger.debug(f"Prompt length: {len(prompt)} chars")
+        return self._call_api_with_retry(system, prompt, email_context)
+
+    def chat_stream(self,
+                    user_message: str,
+                    email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
+        """Stream response chunks."""
+        system = self.SYSTEM_PROMPT.format(
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+        )
+        prompt = self._build_prompt(user_message, email_context)
+        yield from self._stream_tokens_with_retry(system, prompt, email_context)
+
     def generate_meeting_prep(self,
                               meeting: Dict[str, Any],
                               email_context: List[Dict[str, Any]]) -> str:
         """Generate a meeting preparation brief."""
         system, prompt = self._build_meeting_context(meeting, email_context)
-        return self._call_api(system, prompt)
+        return self._call_api_with_retry(system, prompt, email_context)
 
     def generate_meeting_prep_stream(self,
                                      meeting: Dict[str, Any],
                                      email_context: List[Dict[str, Any]]) -> Generator[str, None, None]:
         """Stream a meeting preparation brief."""
         system, prompt = self._build_meeting_context(meeting, email_context)
-        yield from self._stream_tokens(system, prompt)
+        yield from self._stream_tokens_with_retry(system, prompt, email_context)
 
     def is_available(self) -> bool:
         """Check if llama.cpp server is running."""
@@ -301,16 +399,154 @@ Please prepare the meeting brief based on these emails."""
         return []
 
 
-# Keep the same function name so the rest of the app doesn't need changes
-_client: Optional[LlamaCppClient] = None
+class ClaudeClient(BaseLLMClient):
+    """Claude API client using the Anthropic SDK."""
 
-def get_ollama_client() -> LlamaCppClient:
-    global _client
-    if _client is None:
+    def __init__(self,
+                 api_key: str,
+                 model: str = "claude-haiku-4-5-20251001",
+                 temperature: float = 0.3):
+        super().__init__(temperature)
+        import anthropic
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = model
+        self.max_tokens = 4096
+
+    def set_model(self, model: str):
+        """Update model at runtime."""
+        self.model = model
+        logger.info(f"Claude model updated to {self.model}")
+
+    def chat(self,
+             user_message: str,
+             email_context: Optional[List[Dict[str, Any]]] = None) -> str:
+        """Send message, get response via Claude API."""
+        system = self.SYSTEM_PROMPT.format(
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+        )
+        prompt = self._build_prompt(user_message, email_context)
+        logger.debug(f"Claude prompt length: {len(prompt)} chars")
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system=system,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+
+    def chat_stream(self,
+                    user_message: str,
+                    email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
+        """Stream response chunks via Claude API."""
+        system = self.SYSTEM_PROMPT.format(
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+        )
+        prompt = self._build_prompt(user_message, email_context)
+
+        with self.client.messages.stream(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system=system,
+            messages=[{"role": "user", "content": prompt}]
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+
+    def generate_meeting_prep(self,
+                              meeting: Dict[str, Any],
+                              email_context: List[Dict[str, Any]]) -> str:
+        """Generate a meeting preparation brief via Claude API."""
+        system, prompt = self._build_meeting_context(meeting, email_context)
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system=system,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+
+    def generate_meeting_prep_stream(self,
+                                     meeting: Dict[str, Any],
+                                     email_context: List[Dict[str, Any]]) -> Generator[str, None, None]:
+        """Stream a meeting preparation brief via Claude API."""
+        system, prompt = self._build_meeting_context(meeting, email_context)
+
+        with self.client.messages.stream(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system=system,
+            messages=[{"role": "user", "content": prompt}]
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+
+    def is_available(self) -> bool:
+        """Check if Claude API is accessible."""
+        try:
+            # Quick test with minimal tokens
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=10,
+                messages=[{"role": "user", "content": "hi"}]
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Claude API not available: {e}")
+            return False
+
+    def list_models(self) -> List[str]:
+        """Return available Claude models."""
+        return [self.model]
+
+
+# Client management
+_local_client: Optional[LlamaCppClient] = None
+_claude_client: Optional[ClaudeClient] = None
+
+
+def get_llm_client(backend: str = "local") -> BaseLLMClient:
+    """Get LLM client by backend type.
+
+    Args:
+        backend: "local" for llama.cpp, "claude" for Claude API
+    """
+    if backend == "claude":
+        return _get_claude_client()
+    return _get_local_client()
+
+
+def _get_local_client() -> LlamaCppClient:
+    global _local_client
+    if _local_client is None:
         import config
-        _client = LlamaCppClient(
+        _local_client = LlamaCppClient(
             base_url=config.LLAMACPP_URL,
             model=config.OLLAMA_MODEL,
             temperature=config.LLM_TEMPERATURE
         )
-    return _client
+    return _local_client
+
+
+def _get_claude_client() -> ClaudeClient:
+    global _claude_client
+    if _claude_client is None:
+        import config
+        if not config.CLAUDE_API_KEY:
+            raise ValueError("CLAUDE_API_KEY not set in .env — cannot use Claude backend")
+        _claude_client = ClaudeClient(
+            api_key=config.CLAUDE_API_KEY,
+            model=config.CLAUDE_MODEL,
+            temperature=config.LLM_TEMPERATURE
+        )
+    return _claude_client
+
+
+# Backward-compatible alias
+def get_ollama_client() -> LlamaCppClient:
+    return _get_local_client()

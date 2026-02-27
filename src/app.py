@@ -16,7 +16,7 @@ import config
 from rag_engine import get_rag_engine
 from vector_store import get_vector_store
 from ingestion import run_ingestion
-from llm_client import get_ollama_client
+from llm_client import get_ollama_client, get_llm_client
 from outlook_connection import OUTLOOK_AVAILABLE
 
 logging.basicConfig(level=logging.INFO)
@@ -50,21 +50,22 @@ def health():
 def chat():
     data = request.json
     message = data.get('message', '').strip()
-    
+    backend = data.get('backend', 'local')  # "local" or "claude"
+
     if not message:
         return jsonify({'error': 'Message required'}), 400
-    
+
     rag = get_rag_engine()
-    
+
     if data.get('stream'):
         def generate():
-            for item in rag.query_stream(message):
+            for item in rag.query_stream(message, backend=backend):
                 yield f"data: {json.dumps(item)}\n\n"
             yield "data: [DONE]\n\n"
-        
+
         return Response(generate(), mimetype='text/event-stream')
     else:
-        result = rag.query(message)
+        result = rag.query(message, backend=backend)
         return jsonify(result)
 
 
@@ -183,11 +184,18 @@ def meeting_prep(index):
 def get_settings():
     """Get current settings."""
     llm = get_ollama_client()
+
+    # Check which backends are available
+    backends = [{'id': 'local', 'name': 'Local GPU (llama.cpp)', 'available': True}]
+    claude_available = bool(config.CLAUDE_API_KEY)
+    backends.append({'id': 'claude', 'name': 'Claude API (Haiku)', 'available': claude_available})
+
     return jsonify({
         'llm': {
-            'backend': 'llamacpp-vulkan',
+            'backend': 'local',
             'model': llm.model,
-            'temperature': llm.temperature
+            'temperature': llm.temperature,
+            'backends': backends
         },
         'email': {
             'lookback_days': config.EMAIL_LOOKBACK_DAYS,
@@ -201,8 +209,10 @@ def get_settings():
 def update_settings():
     """Update settings at runtime."""
     data = request.json or {}
-    llm = get_ollama_client()
     updated = []
+
+    backend = data.get('backend', 'local')
+    llm = get_llm_client(backend)
 
     if 'temperature' in data:
         llm.set_temperature(float(data['temperature']))
@@ -211,6 +221,9 @@ def update_settings():
     if 'model' in data:
         llm.set_model(data['model'])
         updated.append('model')
+
+    if 'backend' in data:
+        updated.append('backend')
 
     return jsonify({'status': 'updated', 'updated_fields': updated})
 

@@ -402,8 +402,8 @@
                         <div class="setting-group">
                             <label for="llm-backend">Backend</label>
                             <select id="llm-backend">
-                                <option value="ollama">Ollama</option>
-                                <option value="lmstudio">LM Studio</option>
+                                <option value="local">Local GPU (llama.cpp)</option>
+                                <option value="claude">Claude API (Haiku)</option>
                             </select>
                         </div>
                         <div class="setting-group">
@@ -460,8 +460,8 @@
                     <div class="settings-section">
                         <h3>About</h3>
                         <p class="about-text">
-                            InboxAI uses local LLMs (via Ollama or LM Studio) to analyze your emails privately.
-                            All data stays on your machine — nothing is sent to external servers.
+                            InboxAI analyzes your emails using local LLMs (via llama.cpp with Vulkan GPU) or Claude API.
+                            With the local backend, all data stays on your machine. With Claude API, email context is sent to Anthropic for processing.
                         </p>
                         <div class="version-info">
                             <span>Version 1.0.0</span>

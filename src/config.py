@@ -13,6 +13,10 @@ LLAMACPP_URL = os.getenv("LLAMACPP_URL", "http://localhost:8080")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama-3.2-3b-instruct")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 
+# Claude API (optional, for cloud-based analysis)
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
 # Database
 DB_PATH = Path(os.getenv("DB_PATH", Path.home() / ".inboxai" / "chroma"))
 DB_PATH.mkdir(parents=True, exist_ok=True)

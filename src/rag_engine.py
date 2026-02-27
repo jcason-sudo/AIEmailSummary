@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
 from vector_store import get_vector_store
-from llm_client import get_ollama_client
+from llm_client import get_ollama_client, get_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,13 @@ class RAGEngine:
 
         return expanded
 
-    def query(self, user_query: str, n_results: int = 5) -> Dict[str, Any]:
+    def _get_llm(self, backend: Optional[str] = None):
+        """Get LLM client — uses specified backend or default local client."""
+        if backend:
+            return get_llm_client(backend)
+        return self.llm
+
+    def query(self, user_query: str, n_results: int = 15, backend: Optional[str] = None) -> Dict[str, Any]:
         """Process query and return answer with sources."""
 
         query_info = self._detect_query_type(user_query)
@@ -160,8 +166,9 @@ class RAGEngine:
         logger.info(f"Expanded to {len(emails_with_threads)} emails with thread context")
 
         # Generate response with LLM
+        llm = self._get_llm(backend)
         try:
-            answer = self.llm.chat(user_query, email_context=emails_with_threads)
+            answer = llm.chat(user_query, email_context=emails_with_threads)
         except Exception as e:
             logger.error(f"LLM error: {e}")
             answer = f"Error generating response: {e}"
@@ -190,7 +197,7 @@ class RAGEngine:
             ))
         }
 
-    def query_stream(self, user_query: str, n_results: int = 5):
+    def query_stream(self, user_query: str, n_results: int = 15, backend: Optional[str] = None):
         """Stream response chunks."""
 
         query_info = self._detect_query_type(user_query)
@@ -204,7 +211,8 @@ class RAGEngine:
         logger.info(f"Streaming: {len(emails)} search results expanded to {len(emails_with_threads)} with threads")
 
         # Stream LLM response with thread-expanded context
-        for chunk in self.llm.chat_stream(user_query, email_context=emails_with_threads):
+        llm = self._get_llm(backend)
+        for chunk in llm.chat_stream(user_query, email_context=emails_with_threads):
             yield {'type': 'chunk', 'content': chunk}
 
         # Send sources at end

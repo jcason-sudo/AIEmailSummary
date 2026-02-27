@@ -8,6 +8,7 @@ class InboxAI {
         this.apiBase = '';
         this.conversationHistory = [];
         this.isStreaming = false;
+        this.backend = localStorage.getItem('inboxai-backend') || 'local';
 
         this.init();
     }
@@ -98,7 +99,12 @@ class InboxAI {
         this.refreshMeetings?.addEventListener('click', () => this.loadMeetings());
 
         // Settings
-        this.llmBackend?.addEventListener('change', () => this.loadModels());
+        this.llmBackend?.addEventListener('change', () => {
+            this.backend = this.llmBackend.value;
+            localStorage.setItem('inboxai-backend', this.backend);
+            this.loadModels();
+            this.checkHealth();
+        });
         this.llmTemperature?.addEventListener('input', () => {
             this.temperatureValue.textContent = this.llmTemperature.value;
         });
@@ -142,16 +148,17 @@ class InboxAI {
             const response = await fetch(`${this.apiBase}/api/health`);
             const data = await response.json();
 
+            const backendLabel = this.backend === 'claude' ? 'Claude API' : 'llama.cpp';
             if (data.llm_connected) {
                 this.statusIndicator.classList.add('connected');
                 this.statusIndicator.classList.remove('error');
                 this.statusIndicator.querySelector('.status-text').textContent =
-                    `${data.llm_backend || 'Ollama'} connected`;
+                    `${backendLabel} connected`;
             } else {
                 this.statusIndicator.classList.remove('connected');
                 this.statusIndicator.classList.add('error');
                 this.statusIndicator.querySelector('.status-text').textContent =
-                    'LLM disconnected';
+                    this.backend === 'claude' ? 'Claude API (no key)' : 'LLM disconnected';
             }
 
             // Update email count
@@ -207,7 +214,7 @@ class InboxAI {
             const response = await fetch(`${this.apiBase}/api/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message, stream: true })
+                body: JSON.stringify({ message, stream: true, backend: this.backend })
             });
 
             // Handle streaming response
@@ -676,7 +683,23 @@ class InboxAI {
             const response = await fetch(`${this.apiBase}/api/settings`);
             const settings = await response.json();
 
-            this.llmBackend.value = settings.llm?.backend || 'ollama';
+            // Populate backend dropdown from available backends
+            const backends = settings.llm?.backends || [];
+            if (backends.length > 0 && this.llmBackend) {
+                this.llmBackend.innerHTML = backends.map(b =>
+                    `<option value="${b.id}" ${!b.available ? 'disabled' : ''}>${b.name}${!b.available ? ' (no API key)' : ''}</option>`
+                ).join('');
+            }
+
+            // Restore persisted backend selection
+            this.llmBackend.value = this.backend;
+            // If persisted value isn't available, fall back to local
+            if (this.llmBackend.value !== this.backend) {
+                this.backend = 'local';
+                this.llmBackend.value = 'local';
+                localStorage.setItem('inboxai-backend', 'local');
+            }
+
             this.llmTemperature.value = settings.llm?.temperature || 0.3;
             this.temperatureValue.textContent = settings.llm?.temperature || 0.3;
             this.lookbackDays.value = settings.email?.lookback_days || 365;
@@ -714,12 +737,13 @@ class InboxAI {
     async saveSettings() {
         const model = this.llmModel.value;
         const temperature = parseFloat(this.llmTemperature.value);
+        const backend = this.llmBackend.value;
 
         try {
             const response = await fetch(`${this.apiBase}/api/settings`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model, temperature })
+                body: JSON.stringify({ model, temperature, backend })
             });
 
             const result = await response.json();
