@@ -139,14 +139,28 @@ class RAGEngine:
 
         return expanded
 
+    # Backend-specific context limits
+    CONTEXT_LIMITS = {
+        'claude': {'n_results': 30, 'max_content_chars': 2500},
+        'local':  {'n_results': 15, 'max_content_chars': 1000},
+    }
+
     def _get_llm(self, backend: Optional[str] = None):
         """Get LLM client — uses specified backend or default local client."""
         if backend:
             return get_llm_client(backend)
         return self.llm
 
-    def query(self, user_query: str, n_results: int = 15, backend: Optional[str] = None) -> Dict[str, Any]:
+    def _get_limits(self, backend: Optional[str] = None) -> dict:
+        """Get context limits for the given backend."""
+        return self.CONTEXT_LIMITS.get(backend or 'claude', self.CONTEXT_LIMITS['claude'])
+
+    def query(self, user_query: str, n_results: int = None, backend: Optional[str] = None) -> Dict[str, Any]:
         """Process query and return answer with sources."""
+
+        limits = self._get_limits(backend)
+        if n_results is None:
+            n_results = limits['n_results']
 
         query_info = self._detect_query_type(user_query)
         time_range = self._parse_time_reference(user_query)
@@ -167,8 +181,10 @@ class RAGEngine:
 
         # Generate response with LLM
         llm = self._get_llm(backend)
+        ref_map = {}
         try:
-            answer = llm.chat(user_query, email_context=emails_with_threads)
+            answer, ref_map = llm.chat(user_query, email_context=emails_with_threads,
+                                       max_content_chars=limits['max_content_chars'])
         except Exception as e:
             logger.error(f"LLM error: {e}")
             answer = f"Error generating response: {e}"
@@ -183,11 +199,13 @@ class RAGEngine:
                 'date': meta.get('date', ''),
                 'relevance': round(email.get('relevance', 0) * 100, 1),
                 'conversation_id': meta.get('conversation_id', ''),
+                'message_id': meta.get('message_id', ''),
             })
 
         return {
             'answer': answer,
             'sources': sources,
+            'ref_map': ref_map,
             'query_type': query_info.get('type', 'general'),
             'emails_found': len(emails),
             'threads_included': len(set(
@@ -197,8 +215,12 @@ class RAGEngine:
             ))
         }
 
-    def query_stream(self, user_query: str, n_results: int = 15, backend: Optional[str] = None):
+    def query_stream(self, user_query: str, n_results: int = None, backend: Optional[str] = None):
         """Stream response chunks."""
+
+        limits = self._get_limits(backend)
+        if n_results is None:
+            n_results = limits['n_results']
 
         query_info = self._detect_query_type(user_query)
         time_range = self._parse_time_reference(user_query)
@@ -212,8 +234,18 @@ class RAGEngine:
 
         # Stream LLM response with thread-expanded context
         llm = self._get_llm(backend)
-        for chunk in llm.chat_stream(user_query, email_context=emails_with_threads):
-            yield {'type': 'chunk', 'content': chunk}
+        ref_map = {}
+        for chunk in llm.chat_stream(user_query, email_context=emails_with_threads,
+                                     max_content_chars=limits['max_content_chars']):
+            # The LLM client yields a dict with __ref_map__ as the final item
+            if isinstance(chunk, dict) and '__ref_map__' in chunk:
+                ref_map = chunk['__ref_map__']
+            else:
+                yield {'type': 'chunk', 'content': chunk}
+
+        # Send ref_map so frontend can resolve [SRC-N] citations
+        if ref_map:
+            yield {'type': 'ref_map', 'content': ref_map}
 
         # Send sources at end
         sources = [
@@ -222,6 +254,7 @@ class RAGEngine:
                 'subject': e.get('metadata', {}).get('subject', ''),
                 'date': e.get('metadata', {}).get('date', ''),
                 'conversation_id': e.get('metadata', {}).get('conversation_id', ''),
+                'message_id': e.get('metadata', {}).get('message_id', ''),
             }
             for e in emails[:10]
         ]
@@ -442,6 +475,300 @@ class RAGEngine:
                     }
                     for e in all_emails[:10]
                 ]
+            }
+        }
+
+    def deep_research(self, topic: str, backend: Optional[str] = None) -> Dict[str, Any]:
+        """Perform deep research on a topic across all related emails."""
+        limits = self._get_limits(backend)
+
+        # Broad semantic search
+        emails = self.vector_store.search(query=topic, n_results=50)
+
+        # Filter to relevance > 0.3
+        emails = [e for e in emails if e.get('relevance', 0) > 0.3]
+        logger.info(f"Deep research '{topic}': {len(emails)} emails above relevance threshold")
+
+        # Expand with full thread context
+        emails_with_threads = self._expand_with_threads(emails)
+
+        # Group by conversation_id for timeline
+        threads = {}
+        standalone = []
+        for e in emails_with_threads:
+            conv_id = e.get('metadata', {}).get('conversation_id', '')
+            if conv_id:
+                threads.setdefault(conv_id, []).append(e)
+            else:
+                standalone.append(e)
+
+        # Build timeline data
+        timeline = []
+        for conv_id, thread_emails in threads.items():
+            thread_emails.sort(key=lambda x: x.get('metadata', {}).get('date', ''))
+            first = thread_emails[0].get('metadata', {})
+            last = thread_emails[-1].get('metadata', {})
+            participants = list(set(
+                e.get('metadata', {}).get('sender_name') or e.get('metadata', {}).get('sender', '')
+                for e in thread_emails
+                if e.get('metadata', {}).get('sender')
+            ))
+
+            last_dir = last.get('direction', 'received')
+            last_replied = last.get('is_replied', False)
+            if last_dir == 'received' and not last_replied:
+                status = 'needs_action'
+            elif last_dir == 'sent':
+                status = 'awaiting_response'
+            else:
+                status = 'completed'
+
+            timeline.append({
+                'conversation_id': conv_id,
+                'subject': last.get('subject', 'No Subject'),
+                'date_start': first.get('date', ''),
+                'date_end': last.get('date', ''),
+                'message_count': len(thread_emails),
+                'participants': participants,
+                'status': status,
+                'type': 'thread',
+            })
+
+        for e in standalone:
+            meta = e.get('metadata', {})
+            timeline.append({
+                'conversation_id': '',
+                'subject': meta.get('subject', 'No Subject'),
+                'date_start': meta.get('date', ''),
+                'date_end': meta.get('date', ''),
+                'message_count': 1,
+                'participants': [meta.get('sender_name') or meta.get('sender', '')],
+                'status': 'standalone',
+                'type': 'email',
+            })
+
+        # Sort timeline chronologically
+        timeline.sort(key=lambda x: x['date_start'])
+
+        # Generate synthesis via LLM
+        llm = self._get_llm(backend)
+        try:
+            synthesis, ref_map = llm.research_synthesis(
+                topic, emails_with_threads, max_content_chars=limits['max_content_chars']
+            )
+        except Exception as e:
+            logger.error(f"Research synthesis error: {e}")
+            synthesis = f"Error generating research synthesis: {e}"
+            ref_map = {}
+
+        return {
+            'topic': topic,
+            'total_emails': len(emails),
+            'total_threads': len(threads),
+            'timeline': timeline,
+            'synthesis': synthesis,
+            'ref_map': ref_map,
+        }
+
+    def deep_research_stream(self, topic: str, backend: Optional[str] = None):
+        """Stream deep research synthesis, then send timeline metadata."""
+        limits = self._get_limits(backend)
+
+        # Broad semantic search
+        emails = self.vector_store.search(query=topic, n_results=50)
+        emails = [e for e in emails if e.get('relevance', 0) > 0.3]
+
+        # Expand with full thread context
+        emails_with_threads = self._expand_with_threads(emails)
+
+        # Group by conversation_id for timeline
+        threads = {}
+        standalone = []
+        for e in emails_with_threads:
+            conv_id = e.get('metadata', {}).get('conversation_id', '')
+            if conv_id:
+                threads.setdefault(conv_id, []).append(e)
+            else:
+                standalone.append(e)
+
+        # Build timeline
+        timeline = []
+        for conv_id, thread_emails in threads.items():
+            thread_emails.sort(key=lambda x: x.get('metadata', {}).get('date', ''))
+            first = thread_emails[0].get('metadata', {})
+            last = thread_emails[-1].get('metadata', {})
+            participants = list(set(
+                e.get('metadata', {}).get('sender_name') or e.get('metadata', {}).get('sender', '')
+                for e in thread_emails
+                if e.get('metadata', {}).get('sender')
+            ))
+            last_dir = last.get('direction', 'received')
+            last_replied = last.get('is_replied', False)
+            if last_dir == 'received' and not last_replied:
+                status = 'needs_action'
+            elif last_dir == 'sent':
+                status = 'awaiting_response'
+            else:
+                status = 'completed'
+            timeline.append({
+                'conversation_id': conv_id,
+                'subject': last.get('subject', 'No Subject'),
+                'date_start': first.get('date', ''),
+                'date_end': last.get('date', ''),
+                'message_count': len(thread_emails),
+                'participants': participants,
+                'status': status,
+                'type': 'thread',
+            })
+        for e in standalone:
+            meta = e.get('metadata', {})
+            timeline.append({
+                'conversation_id': '',
+                'subject': meta.get('subject', 'No Subject'),
+                'date_start': meta.get('date', ''),
+                'date_end': meta.get('date', ''),
+                'message_count': 1,
+                'participants': [meta.get('sender_name') or meta.get('sender', '')],
+                'status': 'standalone',
+                'type': 'email',
+            })
+        timeline.sort(key=lambda x: x['date_start'])
+
+        # Stream LLM synthesis
+        llm = self._get_llm(backend)
+        ref_map = {}
+        for chunk in llm.research_synthesis_stream(
+            topic, emails_with_threads, max_content_chars=limits['max_content_chars']
+        ):
+            if isinstance(chunk, dict) and '__ref_map__' in chunk:
+                ref_map = chunk['__ref_map__']
+            else:
+                yield {'type': 'chunk', 'content': chunk}
+
+        if ref_map:
+            yield {'type': 'ref_map', 'content': ref_map}
+
+        # Send timeline and metadata at end
+        yield {
+            'type': 'metadata',
+            'content': {
+                'topic': topic,
+                'total_emails': len(emails),
+                'total_threads': len(threads),
+                'timeline': timeline,
+            }
+        }
+
+    def build_topic_map(self, topic: str) -> Dict[str, Any]:
+        """Build an interactive topic map showing connections between emails and people."""
+        emails = self.vector_store.search(query=topic, n_results=50)
+        emails = [e for e in emails if e.get('relevance', 0) > 0.25]
+
+        # Expand with threads
+        emails_with_threads = self._expand_with_threads(emails)
+
+        nodes = []
+        edges = []
+        node_ids = set()
+        person_ids = {}  # email_address -> node_id
+
+        # Group by conversation_id
+        threads = {}
+        standalone = []
+        for e in emails_with_threads:
+            conv_id = e.get('metadata', {}).get('conversation_id', '')
+            if conv_id:
+                threads.setdefault(conv_id, []).append(e)
+            else:
+                standalone.append(e)
+
+        # Thread nodes
+        for conv_id, thread_emails in threads.items():
+            thread_emails.sort(key=lambda x: x.get('metadata', {}).get('date', ''))
+            last_meta = thread_emails[-1].get('metadata', {})
+            subject = last_meta.get('subject', 'No Subject')
+            node_id = f"thread_{conv_id}"
+            if node_id not in node_ids:
+                node_ids.add(node_id)
+                nodes.append({
+                    'id': node_id,
+                    'label': subject[:40],
+                    'type': 'thread',
+                    'subject': subject,
+                    'message_count': len(thread_emails),
+                    'date': last_meta.get('date', ''),
+                })
+
+            # Person nodes + edges
+            for e in thread_emails:
+                meta = e.get('metadata', {})
+                sender = meta.get('sender', '')
+                sender_name = meta.get('sender_name') or sender
+                if sender:
+                    pid = f"person_{sender}"
+                    if pid not in node_ids:
+                        node_ids.add(pid)
+                        nodes.append({
+                            'id': pid,
+                            'label': sender_name,
+                            'type': 'person',
+                            'email': sender,
+                        })
+                        person_ids[sender] = pid
+                    edge_id = f"{pid}->{node_id}"
+                    if edge_id not in node_ids:
+                        node_ids.add(edge_id)
+                        edges.append({
+                            'from': pid,
+                            'to': node_id,
+                            'label': 'participated',
+                        })
+
+        # Standalone email nodes
+        for e in standalone:
+            meta = e.get('metadata', {})
+            email_id = e.get('id', '')
+            node_id = f"email_{email_id}"
+            if node_id not in node_ids:
+                node_ids.add(node_id)
+                nodes.append({
+                    'id': node_id,
+                    'label': (meta.get('subject', 'No Subject'))[:40],
+                    'type': 'email',
+                    'subject': meta.get('subject', ''),
+                    'date': meta.get('date', ''),
+                })
+
+            sender = meta.get('sender', '')
+            sender_name = meta.get('sender_name') or sender
+            if sender:
+                pid = f"person_{sender}"
+                if pid not in node_ids:
+                    node_ids.add(pid)
+                    nodes.append({
+                        'id': pid,
+                        'label': sender_name,
+                        'type': 'person',
+                        'email': sender,
+                    })
+                edge_id = f"{pid}->{node_id}"
+                if edge_id not in node_ids:
+                    node_ids.add(edge_id)
+                    edges.append({
+                        'from': pid,
+                        'to': node_id,
+                        'label': 'sent',
+                    })
+
+        return {
+            'nodes': nodes,
+            'edges': edges,
+            'stats': {
+                'total_nodes': len(nodes),
+                'total_edges': len(edges),
+                'people': len([n for n in nodes if n['type'] == 'person']),
+                'threads': len([n for n in nodes if n['type'] == 'thread']),
+                'standalone': len([n for n in nodes if n['type'] == 'email']),
             }
         }
 

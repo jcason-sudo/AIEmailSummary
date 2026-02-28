@@ -8,7 +8,7 @@ class InboxAI {
         this.apiBase = '';
         this.conversationHistory = [];
         this.isStreaming = false;
-        this.backend = localStorage.getItem('inboxai-backend') || 'local';
+        this.backend = localStorage.getItem('inboxai-backend') || 'claude';
 
         this.init();
     }
@@ -58,6 +58,21 @@ class InboxAI {
         this.meetingPrepSources = document.getElementById('meeting-prep-sources');
         this.prepMeetingTitle = document.getElementById('prep-meeting-title');
 
+        // Research
+        this.researchTopic = document.getElementById('research-topic');
+        this.startResearchBtn = document.getElementById('start-research');
+        this.researchStats = document.getElementById('research-stats');
+        this.researchSynthesis = document.getElementById('research-synthesis');
+        this.researchSynthesisContent = document.getElementById('research-synthesis-content');
+        this.researchTimelineContainer = document.getElementById('research-timeline-container');
+        this.researchTimeline = document.getElementById('research-timeline');
+        this.researchThreadsContainer = document.getElementById('research-threads-container');
+        this.researchThreads = document.getElementById('research-threads');
+        this.researchTabs = document.getElementById('research-tabs');
+
+        // Charts
+        this.charts = {};
+
         // Settings
         this.llmBackend = document.getElementById('llm-backend');
         this.llmModel = document.getElementById('llm-model');
@@ -98,6 +113,23 @@ class InboxAI {
         // Meetings
         this.refreshMeetings?.addEventListener('click', () => this.loadMeetings());
 
+        // Research
+        this.startResearchBtn?.addEventListener('click', () => this.startResearch());
+        this.researchTopic?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') this.startResearch();
+        });
+
+        // Research tabs
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                const tab = btn.dataset.tab;
+                document.getElementById('research-tab-analysis').style.display = tab === 'analysis' ? '' : 'none';
+                document.getElementById('research-tab-topicmap').style.display = tab === 'topicmap' ? '' : 'none';
+            });
+        });
+
         // Settings
         this.llmBackend?.addEventListener('change', () => {
             this.backend = this.llmBackend.value;
@@ -122,24 +154,41 @@ class InboxAI {
 
     // Navigation
     switchView(viewName) {
-        this.navItems.forEach(item => {
-            item.classList.toggle('active', item.dataset.view === viewName);
-        });
-
-        this.views.forEach(view => {
-            view.classList.toggle('active', view.id === `${viewName}-view`);
-        });
-
-        // Load data for specific views
-        if (viewName === 'dashboard') {
-            this.loadDashboard();
-        } else if (viewName === 'tasks') {
-            this.loadTasks();
-        } else if (viewName === 'meetings') {
-            this.loadMeetings();
-        } else if (viewName === 'settings') {
-            this.loadSettings();
+        // Fade out current view
+        const currentView = document.querySelector('.view.active');
+        if (currentView) {
+            currentView.style.opacity = '0';
+            currentView.style.transition = 'opacity 0.15s ease';
         }
+
+        setTimeout(() => {
+            this.navItems.forEach(item => {
+                item.classList.toggle('active', item.dataset.view === viewName);
+            });
+
+            this.views.forEach(view => {
+                const isActive = view.id === `${viewName}-view`;
+                view.classList.toggle('active', isActive);
+                if (isActive) {
+                    view.style.opacity = '0';
+                    requestAnimationFrame(() => {
+                        view.style.transition = 'opacity 0.15s ease';
+                        view.style.opacity = '1';
+                    });
+                }
+            });
+
+            // Load data for specific views
+            if (viewName === 'dashboard') {
+                this.loadDashboard();
+            } else if (viewName === 'tasks') {
+                this.loadTasks();
+            } else if (viewName === 'meetings') {
+                this.loadMeetings();
+            } else if (viewName === 'settings') {
+                this.loadSettings();
+            }
+        }, 150);
     }
 
     // Health Check
@@ -222,6 +271,7 @@ class InboxAI {
             const decoder = new TextDecoder();
             let fullContent = '';
             let sources = [];
+            let refMap = {};
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -241,6 +291,8 @@ class InboxAI {
                             if (parsed.type === 'chunk') {
                                 fullContent += parsed.content;
                                 this.updateMessageContent(loadingEl, fullContent);
+                            } else if (parsed.type === 'ref_map') {
+                                refMap = parsed.content;
                             } else if (parsed.type === 'sources') {
                                 sources = parsed.content;
                             }
@@ -251,9 +303,9 @@ class InboxAI {
                 }
             }
 
-            // Finalize message
+            // Finalize message with ref_map for clickable citations
             loadingEl.classList.remove('loading');
-            this.updateMessageContent(loadingEl, fullContent, sources);
+            this.updateMessageContent(loadingEl, fullContent, sources, refMap);
 
         } catch (error) {
             console.error('Chat error:', error);
@@ -292,9 +344,11 @@ class InboxAI {
         return messageEl;
     }
 
-    updateMessageContent(messageEl, content, sources = []) {
+    updateMessageContent(messageEl, content, sources = [], refMap = {}) {
         const bubble = messageEl.querySelector('.message-bubble');
-        bubble.innerHTML = this.formatContent(content);
+        // Store refMap on the element for inline citation clicks
+        messageEl._refMap = refMap;
+        bubble.innerHTML = this.formatContent(content, refMap);
 
         // Add sources if available
         if (sources.length > 0) {
@@ -317,18 +371,21 @@ class InboxAI {
 
             let html = '';
 
-            // Show threaded sources
+            // Show threaded sources as clickable tags
             for (const [convId, threadSources] of Object.entries(threaded)) {
-                html += `<span class="source-tag thread-tag">
+                const s = threadSources[0];
+                const dataAttrs = `data-message-id="${this.escapeHtml(s.message_id || '')}" data-subject="${this.escapeHtml(s.subject || '')}" data-sender="${this.escapeHtml(s.sender || '')}"`;
+                html += `<span class="source-tag thread-tag clickable-source" ${dataAttrs} onclick="app.openEmail(this)">
                     <span class="thread-icon">&#x1f4e7;</span>
-                    ${this.escapeHtml(threadSources[0].subject || 'Thread')}
+                    ${this.escapeHtml(s.subject || 'Thread')}
                     <span class="thread-count">${threadSources.length} msgs</span>
                 </span>`;
             }
 
-            // Show standalone sources
+            // Show standalone sources as clickable tags
             for (const s of standalone.slice(0, 5)) {
-                html += `<span class="source-tag">
+                const dataAttrs = `data-message-id="${this.escapeHtml(s.message_id || '')}" data-subject="${this.escapeHtml(s.subject || '')}" data-sender="${this.escapeHtml(s.sender || '')}"`;
+                html += `<span class="source-tag clickable-source" ${dataAttrs} onclick="app.openEmail(this)">
                     ${this.escapeHtml(s.sender || 'Unknown')}
                     ${s.relevance ? `<span class="relevance">${s.relevance}%</span>` : ''}
                 </span>`;
@@ -339,7 +396,7 @@ class InboxAI {
         }
     }
 
-    formatContent(content) {
+    formatContent(content, refMap = {}) {
         if (!content) return '';
 
         // Basic markdown-like formatting
@@ -354,6 +411,20 @@ class InboxAI {
         // Code inline
         html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
 
+        // Replace [SRC-N] citations with clickable badges
+        html = html.replace(/\[SRC-(\d+)\]/g, (match, num) => {
+            const key = `SRC-${num}`;
+            const ref = refMap[key];
+            if (ref) {
+                const subject = this.escapeHtml(ref.subject || 'Email').substring(0, 30);
+                const msgId = this.escapeHtml(ref.message_id || '');
+                const sender = this.escapeHtml(ref.sender || '');
+                const subjectFull = this.escapeHtml(ref.subject || '');
+                return `<span class="src-badge" title="${sender}: ${subjectFull}" data-message-id="${msgId}" data-subject="${subjectFull}" data-sender="${sender}" onclick="app.openEmail(this)">[${num}]</span>`;
+            }
+            return `<span class="src-badge src-badge-unknown">[${num}]</span>`;
+        });
+
         // Line breaks
         html = html.replace(/\n/g, '<br>');
 
@@ -362,6 +433,32 @@ class InboxAI {
         html = html.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
 
         return html;
+    }
+
+    async openEmail(element) {
+        const messageId = element.dataset.messageId || '';
+        const subject = element.dataset.subject || '';
+        const sender = element.dataset.sender || '';
+
+        if (!messageId && !subject) {
+            console.warn('No message_id or subject to open email');
+            return;
+        }
+
+        try {
+            const response = await fetch(`${this.apiBase}/api/email/open`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message_id: messageId, subject, sender })
+            });
+
+            const result = await response.json();
+            if (result.error) {
+                console.warn('Could not open email:', result.error);
+            }
+        } catch (error) {
+            console.error('Failed to open email:', error);
+        }
     }
 
     escapeHtml(text) {
@@ -381,14 +478,10 @@ class InboxAI {
             const statsResponse = await fetch(`${this.apiBase}/api/stats`);
             const stats = await statsResponse.json();
 
-            document.getElementById('stat-total').textContent =
-                (stats.total_emails || 0).toLocaleString();
-            document.getElementById('stat-unread').textContent =
-                (stats.unread || 0).toLocaleString();
-            document.getElementById('stat-sent').textContent =
-                (stats.sent || 0).toLocaleString();
-            document.getElementById('stat-flagged').textContent =
-                (stats.flagged || 0).toLocaleString();
+            this.animateCountUp('stat-total', stats.total_emails || 0);
+            this.animateCountUp('stat-unread', stats.unread || 0);
+            this.animateCountUp('stat-sent', stats.sent || 0);
+            this.animateCountUp('stat-flagged', stats.flagged || 0);
 
             // Load summary
             const summaryResponse = await fetch(`${this.apiBase}/api/summary`);
@@ -421,6 +514,9 @@ class InboxAI {
                 this.awaitingResponseList.innerHTML =
                     '<div class="empty-placeholder">No emails awaiting response</div>';
             }
+
+            // Load analytics charts
+            this.loadAnalytics();
 
         } catch (error) {
             console.error('Dashboard load error:', error);
@@ -823,6 +919,400 @@ class InboxAI {
         } catch (error) {
             console.error('Clear database error:', error);
             alert('Failed to clear database');
+        }
+    }
+    // Count-up animation
+    animateCountUp(elementId, target) {
+        const el = document.getElementById(elementId);
+        if (!el) return;
+        const duration = 600;
+        const start = parseInt(el.textContent.replace(/,/g, '')) || 0;
+        if (start === target) { el.textContent = target.toLocaleString(); return; }
+        const startTime = performance.now();
+        const step = (now) => {
+            const progress = Math.min((now - startTime) / duration, 1);
+            const eased = 1 - Math.pow(1 - progress, 3); // ease-out cubic
+            const current = Math.round(start + (target - start) * eased);
+            el.textContent = current.toLocaleString();
+            if (progress < 1) requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+    }
+
+    // Deep Research
+    async startResearch() {
+        const topic = this.researchTopic?.value.trim();
+        if (!topic) return;
+
+        // Show UI elements
+        this.researchStats.style.display = '';
+        this.researchSynthesis.style.display = '';
+        this.researchTabs.style.display = '';
+        this.researchSynthesisContent.innerHTML = '<div class="loading-placeholder">Researching...</div>';
+        this.researchTimelineContainer.style.display = 'none';
+        this.researchThreadsContainer.style.display = 'none';
+        document.getElementById('research-email-count').textContent = '...';
+        document.getElementById('research-thread-count').textContent = '...';
+
+        // Switch to analysis tab
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'analysis'));
+        document.getElementById('research-tab-analysis').style.display = '';
+        document.getElementById('research-tab-topicmap').style.display = 'none';
+
+        try {
+            const response = await fetch(`${this.apiBase}/api/research`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ topic, stream: true, backend: this.backend })
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let fullContent = '';
+            let refMap = {};
+            let metadata = null;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value);
+                const lines = chunk.split('\n');
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6);
+                        if (data === '[DONE]') continue;
+
+                        try {
+                            const parsed = JSON.parse(data);
+                            if (parsed.type === 'chunk') {
+                                fullContent += parsed.content;
+                                this.researchSynthesisContent.innerHTML = this.formatContent(fullContent, refMap);
+                            } else if (parsed.type === 'ref_map') {
+                                refMap = parsed.content;
+                            } else if (parsed.type === 'metadata') {
+                                metadata = parsed.content;
+                            }
+                        } catch (e) { /* ignore */ }
+                    }
+                }
+            }
+
+            // Final render with ref_map
+            this.researchSynthesisContent.innerHTML = this.formatContent(fullContent, refMap);
+
+            // Render metadata
+            if (metadata) {
+                document.getElementById('research-email-count').textContent = metadata.total_emails || 0;
+                document.getElementById('research-thread-count').textContent = metadata.total_threads || 0;
+
+                if (metadata.timeline && metadata.timeline.length > 0) {
+                    this.renderTimeline(metadata.timeline);
+                    this.renderThreadList(metadata.timeline);
+                }
+            }
+
+            // Auto-fetch topic map
+            this.fetchTopicMap(topic);
+
+        } catch (error) {
+            console.error('Research error:', error);
+            this.researchSynthesisContent.innerHTML = '<div class="empty-placeholder">Error performing research. Check that the LLM is running.</div>';
+        }
+    }
+
+    renderTimeline(timeline) {
+        this.researchTimelineContainer.style.display = '';
+        let html = '';
+        for (const item of timeline) {
+            const dateStr = item.date_start ? new Date(item.date_start).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) : '';
+            const participants = (item.participants || []).slice(0, 3).map(p => this.escapeHtml(p)).join(', ');
+            html += `
+                <div class="timeline-node">
+                    <div class="timeline-date">${dateStr}</div>
+                    <div class="timeline-subject">${this.escapeHtml(item.subject)}</div>
+                    <div class="timeline-meta">
+                        <span>${item.message_count} msg${item.message_count > 1 ? 's' : ''}</span>
+                        <span>${participants}</span>
+                        <span class="timeline-status ${item.status}">${item.status.replace('_', ' ')}</span>
+                    </div>
+                </div>
+            `;
+        }
+        this.researchTimeline.innerHTML = html;
+    }
+
+    renderThreadList(timeline) {
+        const threads = timeline.filter(t => t.type === 'thread');
+        if (threads.length === 0) return;
+
+        this.researchThreadsContainer.style.display = '';
+        let html = '';
+        for (const t of threads) {
+            const dateStr = t.date_end ? new Date(t.date_end).toLocaleDateString([], { month: 'short', day: 'numeric' }) : '';
+            const participants = (t.participants || []).slice(0, 3).map(p => this.escapeHtml(p)).join(', ');
+            html += `
+                <div class="thread-card">
+                    <div class="thread-card-subject">${this.escapeHtml(t.subject)}</div>
+                    <div class="thread-card-meta">
+                        <span>${t.message_count} messages</span>
+                        <span>${participants}</span>
+                        <span>${dateStr}</span>
+                        <span class="timeline-status ${t.status}">${t.status.replace('_', ' ')}</span>
+                    </div>
+                </div>
+            `;
+        }
+        this.researchThreads.innerHTML = html;
+    }
+
+    // Topic Map
+    async fetchTopicMap(topic) {
+        try {
+            const response = await fetch(`${this.apiBase}/api/topic-map`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ topic })
+            });
+            const data = await response.json();
+            this.renderTopicMap(data);
+        } catch (error) {
+            console.error('Topic map error:', error);
+        }
+    }
+
+    renderTopicMap(data) {
+        if (!data.nodes || data.nodes.length === 0) return;
+        if (typeof vis === 'undefined') {
+            console.warn('vis-network not loaded');
+            return;
+        }
+
+        const container = document.getElementById('topic-map-container');
+        container.innerHTML = '';
+
+        const colorMap = {
+            person: { background: '#8b5cf6', border: '#a78bfa', font: { color: '#fff' } },
+            thread: { background: '#3b82f6', border: '#60a5fa', font: { color: '#fff' }, shape: 'box' },
+            email: { background: '#22c55e', border: '#4ade80', font: { color: '#fff' } },
+        };
+
+        const visNodes = data.nodes.map(n => ({
+            id: n.id,
+            label: n.label,
+            color: colorMap[n.type] || colorMap.email,
+            shape: n.type === 'thread' ? 'box' : 'dot',
+            size: n.type === 'person' ? 20 : 15,
+            title: n.subject || n.email || n.label,
+            font: { color: '#f4f4f6', size: 12 },
+        }));
+
+        const visEdges = data.edges.map(e => ({
+            from: e.from,
+            to: e.to,
+            color: { color: 'rgba(139, 92, 246, 0.3)', highlight: '#8b5cf6' },
+            arrows: 'to',
+            smooth: { type: 'continuous' },
+        }));
+
+        const network = new vis.Network(container, {
+            nodes: new vis.DataSet(visNodes),
+            edges: new vis.DataSet(visEdges),
+        }, {
+            physics: {
+                solver: 'forceAtlas2Based',
+                forceAtlas2Based: { gravitationalConstant: -30, springLength: 100 },
+                stabilization: { iterations: 100 },
+            },
+            nodes: {
+                borderWidth: 2,
+                shadow: true,
+            },
+            edges: {
+                width: 1.5,
+            },
+            interaction: {
+                hover: true,
+                tooltipDelay: 100,
+            },
+        });
+
+        // Click handler for node details
+        const detailPanel = document.getElementById('topic-map-detail');
+        network.on('click', (params) => {
+            if (params.nodes.length > 0) {
+                const nodeId = params.nodes[0];
+                const node = data.nodes.find(n => n.id === nodeId);
+                if (node) {
+                    detailPanel.style.display = '';
+                    let html = `<strong>${this.escapeHtml(node.label)}</strong><br>`;
+                    html += `<span style="color: var(--color-text-tertiary)">Type: ${node.type}</span><br>`;
+                    if (node.subject) html += `Subject: ${this.escapeHtml(node.subject)}<br>`;
+                    if (node.email) html += `Email: ${this.escapeHtml(node.email)}<br>`;
+                    if (node.message_count) html += `Messages: ${node.message_count}<br>`;
+                    if (node.date) html += `Date: ${new Date(node.date).toLocaleDateString()}<br>`;
+                    detailPanel.innerHTML = html;
+                }
+            } else {
+                detailPanel.style.display = 'none';
+            }
+        });
+    }
+
+    // Analytics Charts
+    async loadAnalytics() {
+        try {
+            const response = await fetch(`${this.apiBase}/api/analytics`);
+            const data = await response.json();
+
+            // Chart.js dark theme defaults
+            const textColor = '#a0a0aa';
+            const gridColor = 'rgba(255, 255, 255, 0.06)';
+
+            // Volume over time
+            const dates = Object.keys(data.volume_by_date || {});
+            if (dates.length > 0) {
+                this.destroyChart('volume');
+                const ctx = document.getElementById('volume-chart');
+                if (ctx) {
+                    this.charts.volume = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: dates.map(d => {
+                                const dt = new Date(d + 'T00:00:00');
+                                return dt.toLocaleDateString([], { month: 'short', day: 'numeric' });
+                            }),
+                            datasets: [
+                                {
+                                    label: 'Received',
+                                    data: dates.map(d => data.volume_by_date[d].received),
+                                    borderColor: '#8b5cf6',
+                                    backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                                    fill: true,
+                                    tension: 0.3,
+                                },
+                                {
+                                    label: 'Sent',
+                                    data: dates.map(d => data.volume_by_date[d].sent),
+                                    borderColor: '#22c55e',
+                                    backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                                    fill: true,
+                                    tension: 0.3,
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            plugins: { legend: { labels: { color: textColor } } },
+                            scales: {
+                                x: { ticks: { color: textColor, maxTicksLimit: 10 }, grid: { color: gridColor } },
+                                y: { ticks: { color: textColor }, grid: { color: gridColor } }
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Top senders
+            const senders = data.top_senders || [];
+            if (senders.length > 0) {
+                this.destroyChart('senders');
+                const ctx = document.getElementById('senders-chart');
+                if (ctx) {
+                    this.charts.senders = new Chart(ctx, {
+                        type: 'bar',
+                        data: {
+                            labels: senders.map(s => s.name.length > 20 ? s.name.substring(0, 20) + '...' : s.name),
+                            datasets: [{
+                                label: 'Emails',
+                                data: senders.map(s => s.count),
+                                backgroundColor: 'rgba(139, 92, 246, 0.6)',
+                                borderColor: '#8b5cf6',
+                                borderWidth: 1,
+                            }]
+                        },
+                        options: {
+                            indexAxis: 'y',
+                            responsive: true,
+                            plugins: { legend: { display: false } },
+                            scales: {
+                                x: { ticks: { color: textColor }, grid: { color: gridColor } },
+                                y: { ticks: { color: textColor, font: { size: 11 } }, grid: { color: gridColor } }
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Hourly distribution
+            const hourly = data.hourly_distribution || {};
+            const hours = Object.keys(hourly).sort((a, b) => parseInt(a) - parseInt(b));
+            if (hours.length > 0) {
+                this.destroyChart('hourly');
+                const ctx = document.getElementById('hourly-chart');
+                if (ctx) {
+                    this.charts.hourly = new Chart(ctx, {
+                        type: 'bar',
+                        data: {
+                            labels: hours.map(h => `${h}:00`),
+                            datasets: [{
+                                label: 'Emails',
+                                data: hours.map(h => hourly[h]),
+                                backgroundColor: 'rgba(59, 130, 246, 0.6)',
+                                borderColor: '#3b82f6',
+                                borderWidth: 1,
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            plugins: { legend: { display: false } },
+                            scales: {
+                                x: { ticks: { color: textColor, maxTicksLimit: 12 }, grid: { color: gridColor } },
+                                y: { ticks: { color: textColor }, grid: { color: gridColor } }
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Sent vs received ratio
+            const totalSent = dates.reduce((sum, d) => sum + (data.volume_by_date[d]?.sent || 0), 0);
+            const totalReceived = dates.reduce((sum, d) => sum + (data.volume_by_date[d]?.received || 0), 0);
+            if (totalSent > 0 || totalReceived > 0) {
+                this.destroyChart('ratio');
+                const ctx = document.getElementById('ratio-chart');
+                if (ctx) {
+                    this.charts.ratio = new Chart(ctx, {
+                        type: 'doughnut',
+                        data: {
+                            labels: ['Received', 'Sent'],
+                            datasets: [{
+                                data: [totalReceived, totalSent],
+                                backgroundColor: ['rgba(139, 92, 246, 0.7)', 'rgba(34, 197, 94, 0.7)'],
+                                borderColor: ['#8b5cf6', '#22c55e'],
+                                borderWidth: 2,
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            plugins: {
+                                legend: { labels: { color: textColor }, position: 'bottom' }
+                            }
+                        }
+                    });
+                }
+            }
+
+        } catch (error) {
+            console.error('Analytics load error:', error);
+        }
+    }
+
+    destroyChart(name) {
+        if (this.charts[name]) {
+            this.charts[name].destroy();
+            this.charts[name] = null;
         }
     }
 }

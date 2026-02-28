@@ -37,6 +37,45 @@ CONVERSATION THREADS:
 - When asked about unanswered emails, use the thread status to determine this accurately
 - When asked about a topic (e.g. "Vodafone"), find ALL threads and standalone emails mentioning it and summarize the full conversation history
 
+SOURCE CITATIONS:
+- Each email has a reference tag like [SRC-1], [SRC-2], etc.
+- After each key point or piece of information, cite the source email by including its [SRC-N] tag
+- Example: "The deadline for the proposal is March 15th [SRC-3]"
+- Always cite sources so the user can verify information
+
+Current date: {current_time}
+"""
+
+    RESEARCH_PROMPT = """You are a deep research analyst examining a corpus of emails about a specific topic.
+Your task is to produce a comprehensive, well-structured analysis with citations.
+
+INSTRUCTIONS:
+1. Analyze ALL provided emails chronologically
+2. Cite every key fact using [SRC-N] tags from the emails
+3. Be thorough — this is a deep research report, not a quick summary
+
+Produce the following sections:
+
+**Executive Summary**
+A 2-3 paragraph overview of everything found about this topic.
+
+**Timeline**
+A chronological narrative of how this topic evolved across emails, with dates and key events.
+
+**Key People**
+Who are the main participants? What role does each play?
+
+**Key Decisions**
+What decisions have been made? Include context and who decided.
+
+**Open Items**
+What is still unresolved or pending action?
+
+**Themes & Patterns**
+Recurring themes, communication patterns, or notable observations across the emails.
+
+CRITICAL: Every factual claim MUST include a [SRC-N] citation. Do NOT fabricate information.
+
 Current date: {current_time}
 """
 
@@ -69,7 +108,7 @@ Current date: {current_time}
         self.temperature = max(0.0, min(1.0, temperature))
         logger.info(f"Temperature updated to {self.temperature}")
 
-    def _format_single_email(self, email: Dict[str, Any], index: int) -> str:
+    def _format_single_email(self, email: Dict[str, Any], index: int, max_content_chars: int = 2500) -> str:
         """Format a single email for LLM context."""
         meta = email.get('metadata', {})
         doc = email.get('document', '')
@@ -92,12 +131,13 @@ Date: {date}
 Status: {is_read} | Replied: {is_replied}
 
 CONTENT:
-{content[:1000]}
-{"[...truncated...]" if len(content) > 1000 else ""}"""
+{content[:max_content_chars]}
+{"[...truncated...]" if len(content) > max_content_chars else ""}"""
 
-    def _format_email_context(self, emails: List[Dict[str, Any]]) -> str:
+    def _format_email_context(self, emails: List[Dict[str, Any]], max_content_chars: int = 2500) -> tuple:
+        """Format emails for LLM context. Returns (context_str, ref_map)."""
         if not emails:
-            return "No relevant emails found in the database."
+            return "No relevant emails found in the database.", {}
 
         threads = {}
         standalone = []
@@ -109,6 +149,7 @@ CONTENT:
                 standalone.append(email)
 
         parts = []
+        ref_map = {}
         idx = 1
 
         for conv_id, thread_emails in threads.items():
@@ -134,31 +175,47 @@ Thread Status: {thread_status} | Messages: {len(thread_emails)}
 ################################################################################""")
 
             for email in thread_emails:
+                meta = email.get('metadata', {})
+                ref_key = f"SRC-{idx}"
+                ref_map[ref_key] = {
+                    'subject': meta.get('subject', ''),
+                    'sender': meta.get('sender_name') or meta.get('sender', ''),
+                    'date': meta.get('date', ''),
+                    'message_id': meta.get('message_id', ''),
+                }
                 parts.append(f"""
---- Message {idx} in thread ---
-{self._format_single_email(email, idx)}""")
+--- Message [SRC-{idx}] in thread ---
+{self._format_single_email(email, idx, max_content_chars)}""")
                 idx += 1
 
         for email in standalone:
+            meta = email.get('metadata', {})
+            ref_key = f"SRC-{idx}"
+            ref_map[ref_key] = {
+                'subject': meta.get('subject', ''),
+                'sender': meta.get('sender_name') or meta.get('sender', ''),
+                'date': meta.get('date', ''),
+                'message_id': meta.get('message_id', ''),
+            }
             parts.append(f"""
 ================================================================================
-EMAIL #{idx} (standalone)
+EMAIL [SRC-{idx}] (standalone)
 ================================================================================
-{self._format_single_email(email, idx)}""")
+{self._format_single_email(email, idx, max_content_chars)}""")
             idx += 1
 
         result = "\n".join(parts)
         logger.info(f"Formatted context: {idx - 1} emails ({len(threads)} threads + {len(standalone)} standalone), {len(result)} total chars")
-        return result
+        return result, ref_map
 
-    def _build_prompt(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Build the user prompt from message and email context."""
+    def _build_prompt(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None, max_content_chars: int = 2500) -> tuple:
+        """Build the user prompt from message and email context. Returns (prompt, ref_map)."""
         if email_context:
-            context_str = self._format_email_context(email_context)
+            context_str, ref_map = self._format_email_context(email_context, max_content_chars)
             logger.info(f"Sending {len(email_context)} emails to LLM ({len(context_str)} chars)")
             logger.debug(f"Context preview:\n{context_str[:500]}")
 
-            return f"""I am providing you with {len(email_context)} emails from the user's inbox below.
+            prompt = f"""I am providing you with {len(email_context)} emails from the user's inbox below.
 ONLY use information from these emails to answer the question. Do NOT make up any information.
 
 ===== START OF EMAILS FROM INBOX =====
@@ -171,14 +228,17 @@ INSTRUCTIONS:
 - Answer based ONLY on the emails shown above
 - Reference specific senders and subjects from the emails
 - If no emails are relevant, say "I don't see any emails about that in the results"
-- Be specific and quote from the actual email content when possible"""
+- Be specific and quote from the actual email content when possible
+- After each key point, cite the source email using its [SRC-N] tag"""
+            return prompt, ref_map
         else:
             logger.warning("No email context provided to LLM")
-            return f"""No emails were found in the database for this query.
+            prompt = f"""No emails were found in the database for this query.
 
 User asked: {user_message}
 
 Please let the user know that no relevant emails were found and suggest they may need to ingest emails first."""
+            return prompt, {}
 
     def _build_meeting_context(self, meeting: Dict[str, Any], email_context: List[Dict[str, Any]]):
         """Build system prompt and user prompt for meeting prep."""
@@ -193,7 +253,7 @@ Please let the user know that no relevant emails were found and suggest they may
         )
 
         if email_context:
-            context_str = self._format_email_context(email_context)
+            context_str, ref_map = self._format_email_context(email_context)
             prompt = f"""Here are {len(email_context)} relevant emails and meeting summaries found for this meeting topic:
 
 ===== START OF RELEVANT EMAILS =====
@@ -206,11 +266,29 @@ Please prepare the meeting brief based on these emails."""
 
         return system, prompt
 
+    def _build_research_prompt(self, topic: str, email_context: List[Dict[str, Any]], max_content_chars: int = 2500) -> tuple:
+        """Build the research prompt from topic and email context. Returns (system, prompt, ref_map)."""
+        system = self.RESEARCH_PROMPT.format(
+            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+        )
+        context_str, ref_map = self._format_email_context(email_context, max_content_chars)
+        prompt = f"""Research topic: "{topic}"
+
+I am providing {len(email_context)} emails related to this topic.
+Analyze them thoroughly and produce a comprehensive research report.
+
+===== START OF EMAILS =====
+{context_str}
+===== END OF EMAILS =====
+
+Produce the deep research report now."""
+        return system, prompt, ref_map
+
     # Public interface - subclasses must implement these
-    def chat(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None) -> str:
+    def chat(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None, max_content_chars: int = 2500) -> str:
         raise NotImplementedError
 
-    def chat_stream(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
+    def chat_stream(self, user_message: str, email_context: Optional[List[Dict[str, Any]]] = None, max_content_chars: int = 2500) -> Generator[str, None, None]:
         raise NotImplementedError
 
     def generate_meeting_prep(self, meeting: Dict[str, Any], email_context: List[Dict[str, Any]]) -> str:
@@ -286,7 +364,7 @@ class LlamaCppClient(BaseLLMClient):
                 remaining = remaining[cut:]
                 logger.info(f"Retry {attempt + 1}: reduced to {len(remaining)} emails")
 
-                new_prompt = self._build_prompt(
+                new_prompt, _ = self._build_prompt(
                     prompt.split("USER'S QUESTION: ")[-1].split("\n\nINSTRUCTIONS:")[0] if "USER'S QUESTION:" in prompt else prompt,
                     remaining
                 )
@@ -333,7 +411,7 @@ class LlamaCppClient(BaseLLMClient):
                     user_msg = prompt.split("USER'S QUESTION: ")[-1].split("\n\nINSTRUCTIONS:")[0]
                 else:
                     user_msg = prompt
-                new_prompt = self._build_prompt(user_msg, remaining)
+                new_prompt, _ = self._build_prompt(user_msg, remaining)
 
                 try:
                     yield from self._stream_tokens(system, new_prompt)
@@ -347,24 +425,29 @@ class LlamaCppClient(BaseLLMClient):
 
     def chat(self,
              user_message: str,
-             email_context: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Send message, get response."""
+             email_context: Optional[List[Dict[str, Any]]] = None,
+             max_content_chars: int = 1000) -> tuple:
+        """Send message, get response. Returns (answer, ref_map)."""
         system = self.SYSTEM_PROMPT.format(
             current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
         )
-        prompt = self._build_prompt(user_message, email_context)
+        prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
         logger.debug(f"Prompt length: {len(prompt)} chars")
-        return self._call_api_with_retry(system, prompt, email_context)
+        answer = self._call_api_with_retry(system, prompt, email_context)
+        return answer, ref_map
 
     def chat_stream(self,
                     user_message: str,
-                    email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
-        """Stream response chunks."""
+                    email_context: Optional[List[Dict[str, Any]]] = None,
+                    max_content_chars: int = 1000) -> Generator:
+        """Stream response chunks. Yields tokens, then a final dict with ref_map."""
         system = self.SYSTEM_PROMPT.format(
             current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
         )
-        prompt = self._build_prompt(user_message, email_context)
+        prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
         yield from self._stream_tokens_with_retry(system, prompt, email_context)
+        # Yield ref_map as final item for the RAG engine to pick up
+        yield {'__ref_map__': ref_map}
 
     def generate_meeting_prep(self,
                               meeting: Dict[str, Any],
@@ -379,6 +462,18 @@ class LlamaCppClient(BaseLLMClient):
         """Stream a meeting preparation brief."""
         system, prompt = self._build_meeting_context(meeting, email_context)
         yield from self._stream_tokens_with_retry(system, prompt, email_context)
+
+    def research_synthesis(self, topic: str, email_context: List[Dict[str, Any]], max_content_chars: int = 1000) -> tuple:
+        """Generate a research synthesis. Returns (answer, ref_map)."""
+        system, prompt, ref_map = self._build_research_prompt(topic, email_context, max_content_chars)
+        answer = self._call_api_with_retry(system, prompt, email_context)
+        return answer, ref_map
+
+    def research_synthesis_stream(self, topic: str, email_context: List[Dict[str, Any]], max_content_chars: int = 1000) -> Generator:
+        """Stream research synthesis. Yields tokens, then ref_map dict."""
+        system, prompt, ref_map = self._build_research_prompt(topic, email_context, max_content_chars)
+        yield from self._stream_tokens_with_retry(system, prompt, email_context)
+        yield {'__ref_map__': ref_map}
 
     def is_available(self) -> bool:
         """Check if llama.cpp server is running."""
@@ -419,12 +514,13 @@ class ClaudeClient(BaseLLMClient):
 
     def chat(self,
              user_message: str,
-             email_context: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Send message, get response via Claude API."""
+             email_context: Optional[List[Dict[str, Any]]] = None,
+             max_content_chars: int = 2500) -> tuple:
+        """Send message, get response via Claude API. Returns (answer, ref_map)."""
         system = self.SYSTEM_PROMPT.format(
             current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
         )
-        prompt = self._build_prompt(user_message, email_context)
+        prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
         logger.debug(f"Claude prompt length: {len(prompt)} chars")
 
         response = self.client.messages.create(
@@ -434,16 +530,17 @@ class ClaudeClient(BaseLLMClient):
             system=system,
             messages=[{"role": "user", "content": prompt}]
         )
-        return response.content[0].text
+        return response.content[0].text, ref_map
 
     def chat_stream(self,
                     user_message: str,
-                    email_context: Optional[List[Dict[str, Any]]] = None) -> Generator[str, None, None]:
-        """Stream response chunks via Claude API."""
+                    email_context: Optional[List[Dict[str, Any]]] = None,
+                    max_content_chars: int = 2500) -> Generator:
+        """Stream response chunks via Claude API. Yields tokens, then ref_map dict."""
         system = self.SYSTEM_PROMPT.format(
             current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
         )
-        prompt = self._build_prompt(user_message, email_context)
+        prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
 
         with self.client.messages.stream(
             model=self.model,
@@ -454,6 +551,7 @@ class ClaudeClient(BaseLLMClient):
         ) as stream:
             for text in stream.text_stream:
                 yield text
+        yield {'__ref_map__': ref_map}
 
     def generate_meeting_prep(self,
                               meeting: Dict[str, Any],
@@ -485,6 +583,32 @@ class ClaudeClient(BaseLLMClient):
         ) as stream:
             for text in stream.text_stream:
                 yield text
+
+    def research_synthesis(self, topic: str, email_context: List[Dict[str, Any]], max_content_chars: int = 2500) -> tuple:
+        """Generate a research synthesis via Claude API. Returns (answer, ref_map)."""
+        system, prompt, ref_map = self._build_research_prompt(topic, email_context, max_content_chars)
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system=system,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text, ref_map
+
+    def research_synthesis_stream(self, topic: str, email_context: List[Dict[str, Any]], max_content_chars: int = 2500) -> Generator:
+        """Stream research synthesis via Claude API. Yields tokens, then ref_map dict."""
+        system, prompt, ref_map = self._build_research_prompt(topic, email_context, max_content_chars)
+        with self.client.messages.stream(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system=system,
+            messages=[{"role": "user", "content": prompt}]
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+        yield {'__ref_map__': ref_map}
 
     def is_available(self) -> bool:
         """Check if Claude API is accessible."""

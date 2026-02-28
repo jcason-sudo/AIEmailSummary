@@ -1,5 +1,5 @@
 """
-Email ingestion from PST files and Outlook.
+Email ingestion from PST files, Outlook, and IMAP (Gmail, Yahoo, etc.).
 """
 
 import logging
@@ -10,6 +10,7 @@ from typing import List, Optional
 from vector_store import get_vector_store
 from pst_parser import PSTParser
 from outlook_connection import OutlookConnection, OUTLOOK_AVAILABLE
+from imap_connection import IMAPConnection, parse_imap_accounts
 import config
 
 logger = logging.getLogger(__name__)
@@ -78,21 +79,72 @@ def ingest_outlook(since: Optional[datetime] = None) -> int:
     return total_added
 
 
+def ingest_imap(since: Optional[datetime] = None) -> dict:
+    """Ingest from configured IMAP accounts (Gmail, Yahoo, etc.)."""
+    accounts = parse_imap_accounts(config.IMAP_ACCOUNTS)
+    if not accounts:
+        logger.info("No IMAP accounts configured")
+        return {}
+
+    store = get_vector_store()
+    results = {}
+
+    for acct in accounts:
+        label = acct.get('provider', acct['host'])
+        logger.info(f"Ingesting from IMAP: {label} ({acct['username']})")
+
+        total_added = 0
+        emails = []
+
+        conn = IMAPConnection(
+            host=acct['host'],
+            port=acct['port'],
+            username=acct['username'],
+            password=acct['password'],
+            provider=acct.get('provider', 'default'),
+            label=label,
+        )
+
+        try:
+            with conn:
+                for em in conn.get_emails(since=since):
+                    emails.append(em)
+
+                    if len(emails) >= 100:
+                        added = store.add_emails(emails)
+                        total_added += added
+                        logger.info(f"IMAP batch ({label}): {added} added (total: {total_added})")
+                        emails = []
+
+            if emails:
+                added = store.add_emails(emails)
+                total_added += added
+
+        except Exception as e:
+            logger.error(f"IMAP ingestion error for {label}: {e}")
+
+        logger.info(f"IMAP ingestion complete ({label}): {total_added} emails")
+        results[f"imap_{label}"] = total_added
+
+    return results
+
+
 def run_ingestion(
     pst_paths: Optional[List[Path]] = None,
     include_outlook: bool = True,
+    include_imap: bool = True,
     days_back: int = 365
 ) -> dict:
     """Run full ingestion."""
-    
+
     since = datetime.now() - timedelta(days=days_back)
     logger.info(f"Ingesting emails since {since.strftime('%Y-%m-%d')}")
-    
+
     results = {
         "pst_emails": 0,
         "outlook_emails": 0
     }
-    
+
     # PST files
     if pst_paths:
         for path in pst_paths:
@@ -102,14 +154,19 @@ def run_ingestion(
             elif path.is_dir():
                 for pst in path.glob("**/*.pst"):
                     results["pst_emails"] += ingest_pst(pst, since)
-    
+
     # Outlook
     if include_outlook:
         results["outlook_emails"] = ingest_outlook(since)
-    
+
+    # IMAP (Gmail, Yahoo, etc.)
+    if include_imap:
+        imap_results = ingest_imap(since)
+        results.update(imap_results)
+
     # Get final count from store
     store = get_vector_store()
     total_in_db = store._collection.count()
     logger.info(f"Total emails in database: {total_in_db}")
-    
+
     return results

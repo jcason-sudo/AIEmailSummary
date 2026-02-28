@@ -26,7 +26,12 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 # Email ingestion
 EMAIL_LOOKBACK_DAYS = int(os.getenv("EMAIL_LOOKBACK_DAYS", "365"))
-OUTLOOK_FOLDERS = [f.strip() for f in os.getenv("OUTLOOK_FOLDERS", "Inbox,Sent Items").split(",")]
+OUTLOOK_FOLDERS = [f.strip() for f in os.getenv("OUTLOOK_FOLDERS", "Inbox,Sent Items,Zoom AI summary,Confluence,Drafts").split(",")]
+
+# IMAP accounts (Gmail, Yahoo, etc.)
+# Format: "provider:user@email.com:app_password;provider:user@email.com:app_password"
+# Providers: gmail, yahoo, outlook, hotmail
+IMAP_ACCOUNTS = os.getenv("IMAP_ACCOUNTS", "")
 
 # Server
 HOST = os.getenv("HOST", "127.0.0.1")

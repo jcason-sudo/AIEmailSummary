@@ -50,7 +50,7 @@ def health():
 def chat():
     data = request.json
     message = data.get('message', '').strip()
-    backend = data.get('backend', 'local')  # "local" or "claude"
+    backend = data.get('backend', 'claude')  # "claude" or "local"
 
     if not message:
         return jsonify({'error': 'Message required'}), 400
@@ -114,11 +114,13 @@ def ingest():
     days = data.get('days') or data.get('days_back') or config.EMAIL_LOOKBACK_DAYS
     pst_paths = data.get('pst_paths', [])
     include_outlook = data.get('include_outlook', True)
+    include_imap = data.get('include_imap', True)
 
     try:
         results = run_ingestion(
             pst_paths=[Path(p) for p in pst_paths] if pst_paths else None,
             include_outlook=include_outlook,
+            include_imap=include_imap,
             days_back=int(days)
         )
         return jsonify(results)
@@ -178,6 +180,50 @@ def meeting_prep(index):
     else:
         result = rag.prepare_for_meeting(meeting)
         return jsonify(result)
+
+
+@app.route('/api/research', methods=['POST'])
+def research():
+    """Deep research on a topic across all related emails."""
+    data = request.json
+    topic = data.get('topic', '').strip()
+    backend = data.get('backend', 'claude')
+
+    if not topic:
+        return jsonify({'error': 'Topic required'}), 400
+
+    rag = get_rag_engine()
+
+    if data.get('stream'):
+        def generate():
+            for item in rag.deep_research_stream(topic, backend=backend):
+                yield f"data: {json.dumps(item)}\n\n"
+            yield "data: [DONE]\n\n"
+        return Response(generate(), mimetype='text/event-stream')
+    else:
+        result = rag.deep_research(topic, backend=backend)
+        return jsonify(result)
+
+
+@app.route('/api/topic-map', methods=['POST'])
+def topic_map():
+    """Build a topic map showing connections between emails and people."""
+    data = request.json
+    topic = data.get('topic', '').strip()
+
+    if not topic:
+        return jsonify({'error': 'Topic required'}), 400
+
+    rag = get_rag_engine()
+    result = rag.build_topic_map(topic)
+    return jsonify(result)
+
+
+@app.route('/api/analytics')
+def analytics():
+    """Get email analytics for charts."""
+    store = get_vector_store()
+    return jsonify(store.get_analytics())
 
 
 @app.route('/api/settings', methods=['GET'])
@@ -298,6 +344,58 @@ def debug_query():
             for r in results
         ]
     })
+
+
+@app.route('/api/email/open', methods=['POST'])
+def open_email():
+    """Open an email in Outlook using EntryID or subject+sender search."""
+    data = request.json or {}
+    message_id = data.get('message_id', '')
+    subject = data.get('subject', '')
+    sender = data.get('sender', '')
+
+    if not OUTLOOK_AVAILABLE:
+        return jsonify({'error': 'Outlook not available'}), 400
+
+    try:
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+
+        mail_item = None
+
+        # Try EntryID first
+        if message_id:
+            try:
+                mail_item = namespace.GetItemFromID(message_id)
+            except Exception:
+                logger.debug(f"EntryID lookup failed for {message_id[:20]}...")
+
+        # Fallback: search by subject + sender in Inbox and Sent Items
+        if mail_item is None and subject:
+            for folder_id in [6, 5]:  # Inbox=6, Sent=5
+                try:
+                    folder = namespace.GetDefaultFolder(folder_id)
+                    items = folder.Items
+                    safe_subject = subject.replace("'", "''")
+                    items = items.Restrict(f"[Subject] = '{safe_subject}'")
+                    if items.Count > 0:
+                        mail_item = items.GetFirst()
+                        break
+                except Exception:
+                    continue
+
+        if mail_item:
+            mail_item.Display()
+            return jsonify({'status': 'opened', 'subject': subject})
+        else:
+            return jsonify({'error': 'Email not found in Outlook'}), 404
+
+    except Exception as e:
+        logger.error(f"Failed to open email: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 def run_server():

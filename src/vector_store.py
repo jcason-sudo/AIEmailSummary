@@ -276,6 +276,82 @@ class EmailVectorStore:
                 
         return stats
         
+    def get_analytics(self) -> Dict[str, Any]:
+        """Get detailed email analytics for charts."""
+        total = self._collection.count()
+        if total == 0:
+            return {
+                'volume_by_date': {},
+                'top_senders': [],
+                'top_recipients': [],
+                'hourly_distribution': {},
+                'folder_distribution': {},
+            }
+
+        results = self._collection.get(
+            include=["metadatas"],
+            limit=min(total, 5000)
+        )
+
+        volume_by_date = {}
+        sender_counts = {}
+        recipient_counts = {}
+        hourly = {str(h): 0 for h in range(24)}
+        folder_dist = {}
+
+        for meta in results['metadatas']:
+            date_str = meta.get('date', '')
+            direction = meta.get('direction', 'received')
+            sender = meta.get('sender_name') or meta.get('sender', 'Unknown')
+            recipients = meta.get('recipients', '')
+            folder = meta.get('folder', 'Inbox')
+
+            # Volume by date
+            if date_str:
+                try:
+                    day = date_str[:10]  # YYYY-MM-DD
+                    if day not in volume_by_date:
+                        volume_by_date[day] = {'sent': 0, 'received': 0}
+                    if direction == 'sent':
+                        volume_by_date[day]['sent'] += 1
+                    else:
+                        volume_by_date[day]['received'] += 1
+
+                    # Hourly distribution
+                    if len(date_str) >= 13:
+                        hour = date_str[11:13]
+                        if hour.isdigit():
+                            hourly[str(int(hour))] = hourly.get(str(int(hour)), 0) + 1
+                except (ValueError, IndexError):
+                    pass
+
+            # Top senders (only received emails)
+            if direction == 'received' and sender:
+                sender_counts[sender] = sender_counts.get(sender, 0) + 1
+
+            # Top recipients (only sent emails)
+            if direction == 'sent' and recipients:
+                for r in recipients.split(','):
+                    r = r.strip()
+                    if r:
+                        recipient_counts[r] = recipient_counts.get(r, 0) + 1
+
+            # Folder distribution
+            if folder:
+                folder_dist[folder] = folder_dist.get(folder, 0) + 1
+
+        # Sort and limit
+        top_senders = sorted(sender_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_recipients = sorted(recipient_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        return {
+            'volume_by_date': dict(sorted(volume_by_date.items())),
+            'top_senders': [{'name': s[0], 'count': s[1]} for s in top_senders],
+            'top_recipients': [{'name': r[0], 'count': r[1]} for r in top_recipients],
+            'hourly_distribution': hourly,
+            'folder_distribution': folder_dist,
+        }
+
     def clear(self):
         """Clear all emails."""
         self._client.delete_collection("emails")
