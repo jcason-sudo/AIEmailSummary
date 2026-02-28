@@ -77,6 +77,15 @@ class InboxAI {
         this.entityMapLegend = document.getElementById('entity-map-legend');
         this.entityMapGraph = document.getElementById('entity-map-graph');
         this.entityMapDetail = document.getElementById('entity-map-detail');
+        this.entityMapDetailContent = document.querySelector('#entity-map-detail .detail-content');
+        this.entityMapTooltip = document.getElementById('entity-map-tooltip');
+        this.entityMapFilters = document.getElementById('entity-map-filters');
+        this.entityMapData = null;
+        this.entityMapNetwork = null;
+        this.entityMapNodeDataSet = null;
+        this.entityMapEdgeDataSet = null;
+        this._entityNodeMap = null;
+        this.activeFilters = { type: 'all', sentiment: 'all' };
 
         // Charts
         this.charts = {};
@@ -142,6 +151,27 @@ class InboxAI {
         this.startEntityMapBtn?.addEventListener('click', () => this.fetchEntityMap());
         this.entityMapSubject?.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') this.fetchEntityMap();
+        });
+
+        // Entity Map filter buttons
+        document.querySelectorAll('.filter-btn[data-filter]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                btn.closest('.filter-group').querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                this.activeFilters.type = btn.dataset.filter;
+                this.applyEntityMapFilters();
+            });
+        });
+        document.querySelectorAll('.filter-btn[data-sentiment]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                btn.closest('.filter-group').querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                this.activeFilters.sentiment = btn.dataset.sentiment;
+                this.applyEntityMapFilters();
+            });
+        });
+        document.getElementById('entity-detail-close')?.addEventListener('click', () => {
+            if (this.entityMapDetail) this.entityMapDetail.style.display = 'none';
         });
 
         // Settings
@@ -1156,18 +1186,22 @@ class InboxAI {
         });
     }
 
-    // Entity Relationship Map
+    // ===== Entity Relationship Map =====
+
     async fetchEntityMap() {
         const subject = this.entityMapSubject?.value.trim();
         if (!subject) return;
 
-        this.entityMapStats.style.display = '';
-        this.entityMapLegend.style.display = '';
-        this.entityMapGraph.innerHTML = '<div class="loading-placeholder">Building entity map...</div>';
-        this.entityMapDetail.style.display = 'none';
-        document.getElementById('entity-people-count').textContent = '...';
-        document.getElementById('entity-topics-count').textContent = '...';
-        document.getElementById('entity-connections-count').textContent = '...';
+        if (this.entityMapStats) this.entityMapStats.style.display = '';
+        if (this.entityMapFilters) this.entityMapFilters.style.display = '';
+        if (this.entityMapGraph) this.entityMapGraph.innerHTML = '<div class="loading-placeholder">Building entity map...</div>';
+        if (this.entityMapDetail) this.entityMapDetail.style.display = 'none';
+        if (this.entityMapTooltip) this.entityMapTooltip.style.display = 'none';
+        const setEl = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+        setEl('entity-people-count', '...');
+        setEl('entity-topics-count', '...');
+        setEl('entity-orgs-count', '...');
+        setEl('entity-connections-count', '...');
 
         try {
             const response = await fetch(`${this.apiBase}/api/entity-map`, {
@@ -1182,12 +1216,13 @@ class InboxAI {
                 return;
             }
 
-            // Update stats
             const stats = data.stats || {};
-            document.getElementById('entity-people-count').textContent = stats.people || 0;
-            document.getElementById('entity-topics-count').textContent = stats.topics || 0;
-            document.getElementById('entity-connections-count').textContent = stats.connections || 0;
+            setEl('entity-people-count', stats.people || 0);
+            setEl('entity-topics-count', stats.topics || 0);
+            setEl('entity-orgs-count', stats.organizations || 0);
+            setEl('entity-connections-count', stats.connections || 0);
 
+            this.entityMapData = data;
             this.renderEntityMap(data);
         } catch (error) {
             console.error('Entity map error:', error);
@@ -1207,133 +1242,323 @@ class InboxAI {
 
         this.entityMapGraph.innerHTML = '';
 
+        // Build a lookup map for raw node data (vis-network may strip custom props)
+        this._entityNodeMap = new Map(data.nodes.map(n => [n.id, n]));
+
+        // --- Tiered sizing ranges ---
+        const TIER_SIZES = {
+            person:       { A: [35, 50], B: [20, 35], C: [10, 20] },
+            topic:        { A: [30, 42], B: [18, 30], C: [10, 18] },
+            organization: { A: [38, 52], B: [24, 38], C: [14, 24] },
+        };
+
+        const sizeForNode = (n) => {
+            const tier = n.tier || 'C';
+            const typeKey = n.type || 'person';
+            const range = (TIER_SIZES[typeKey] || TIER_SIZES.person)[tier] || [10, 20];
+            const count = n.email_count || n.message_count || n.member_count || 1;
+            const peers = data.nodes.filter(x => x.type === typeKey && x.tier === tier);
+            const maxCount = Math.max(...peers.map(x => x.email_count || x.message_count || x.member_count || 1), 1);
+            const t = maxCount > 1 ? (count - 1) / (maxCount - 1) : 0.5;
+            return range[0] + t * (range[1] - range[0]);
+        };
+
+        // --- Build vis nodes ---
         const visNodes = data.nodes.map(n => {
-            if (n.type === 'person') {
-                const size = Math.min(10 + (n.email_count || 1) * 2, 40);
+            const size = sizeForNode(n);
+            const fontSize = Math.max(10, Math.round(size * 0.35));
+
+            if (n.type === 'organization') {
                 return {
-                    id: n.id,
-                    label: n.label,
-                    shape: 'dot',
-                    size: size,
-                    color: { background: '#8b5cf6', border: '#a78bfa', highlight: { background: '#a78bfa', border: '#c4b5fd' } },
-                    font: { color: '#f4f4f6', size: 12 },
-                    title: `${n.label}\n${n.email}\n${n.email_count} emails`,
+                    id: n.id, label: n.label, shape: 'hexagon', size,
+                    color: { background: '#f59e0b', border: '#fbbf24',
+                             highlight: { background: '#fbbf24', border: '#fde68a' } },
+                    font: { color: '#f4f4f6', size: fontSize },
                 };
-            } else {
-                const size = Math.min(10 + (n.message_count || 1) * 1.5, 35);
+            } else if (n.type === 'topic') {
                 return {
-                    id: n.id,
-                    label: n.label,
-                    shape: 'box',
-                    size: size,
-                    color: { background: '#3b82f6', border: '#60a5fa', highlight: { background: '#60a5fa', border: '#93bbfd' } },
-                    font: { color: '#f4f4f6', size: 11, face: 'DM Sans' },
-                    title: `${n.subject}\n${n.message_count} messages`,
+                    id: n.id, label: n.label, shape: 'box', size,
+                    color: { background: '#3b82f6', border: '#60a5fa',
+                             highlight: { background: '#60a5fa', border: '#93bbfd' } },
+                    font: { color: '#f4f4f6', size: fontSize, face: 'DM Sans' },
                     widthConstraint: { maximum: 200 },
                 };
-            }
-        });
-
-        const visEdges = data.edges.map(e => {
-            if (e.type === 'person_person') {
-                return {
-                    from: e.from,
-                    to: e.to,
-                    width: Math.min(1 + e.weight, 6),
-                    label: e.weight > 1 ? String(e.weight) : '',
-                    color: { color: 'rgba(245, 158, 11, 0.5)', highlight: '#f59e0b' },
-                    font: { color: '#f59e0b', size: 10, strokeWidth: 0 },
-                    smooth: { type: 'continuous' },
-                };
             } else {
                 return {
-                    from: e.from,
-                    to: e.to,
-                    width: Math.min(0.5 + (e.weight || 1) * 0.5, 4),
-                    color: { color: 'rgba(139, 92, 246, 0.2)', highlight: '#8b5cf6' },
-                    arrows: 'to',
-                    smooth: { type: 'continuous' },
+                    id: n.id, label: n.label, shape: 'dot', size,
+                    color: { background: '#8b5cf6', border: '#a78bfa',
+                             highlight: { background: '#a78bfa', border: '#c4b5fd' } },
+                    font: { color: '#f4f4f6', size: fontSize },
                 };
             }
         });
 
+        // --- Edge bundling: group edges by node pair, fan out multiples ---
+        const pairEdges = {};
+        data.edges.forEach(e => {
+            const pairKey = [e.from, e.to].sort().join('||');
+            if (!pairEdges[pairKey]) pairEdges[pairKey] = [];
+            pairEdges[pairKey].push(e);
+        });
+
+        const visEdges = [];
+        for (const [, edges] of Object.entries(pairEdges)) {
+            const count = edges.length;
+            edges.forEach((e, idx) => {
+                const engagement = (e.reply_count || 0) + (e.quote_count || 0);
+                let width;
+                if (e.type === 'person_person') {
+                    width = Math.min(1.5 + engagement * 0.5 + (e.weight || 0) * 0.3, 8);
+                } else if (e.type === 'person_org') {
+                    width = 1;
+                } else {
+                    width = Math.min(0.5 + (e.weight || 1) * 0.5, 4);
+                }
+
+                let roundness = 0;
+                if (count > 1) {
+                    const spread = 0.15;
+                    roundness = -spread * (count - 1) / 2 + spread * idx;
+                }
+
+                const edgeObj = {
+                    from: e.from, to: e.to, width,
+                    smooth: count > 1
+                        ? { type: 'curvedCW', roundness }
+                        : { type: 'continuous' },
+                };
+
+                if (e.type === 'person_person') {
+                    edgeObj.label = e.weight > 1 ? String(e.weight) : '';
+                    edgeObj.color = { color: 'rgba(245,158,11,0.5)', highlight: '#f59e0b' };
+                    edgeObj.font = { color: '#f59e0b', size: 10, strokeWidth: 0 };
+                } else if (e.type === 'person_org') {
+                    edgeObj.color = { color: 'rgba(245,158,11,0.2)', highlight: '#f59e0b' };
+                    edgeObj.dashes = [4, 4];
+                } else {
+                    edgeObj.color = { color: 'rgba(139,92,246,0.2)', highlight: '#8b5cf6' };
+                    edgeObj.arrows = 'to';
+                }
+
+                visEdges.push(edgeObj);
+            });
+        }
+
+        // --- Create DataSets for filtering ---
+        this.entityMapNodeDataSet = new vis.DataSet(visNodes);
+        this.entityMapEdgeDataSet = new vis.DataSet(visEdges);
+
+        // --- Network with barnesHut for collision detection ---
         const network = new vis.Network(this.entityMapGraph, {
-            nodes: new vis.DataSet(visNodes),
-            edges: new vis.DataSet(visEdges),
+            nodes: this.entityMapNodeDataSet,
+            edges: this.entityMapEdgeDataSet,
         }, {
             physics: {
-                solver: 'forceAtlas2Based',
-                forceAtlas2Based: { gravitationalConstant: -40, springLength: 120, springConstant: 0.04 },
-                stabilization: { iterations: 150 },
+                solver: 'barnesHut',
+                barnesHut: {
+                    gravitationalConstant: -3000,
+                    centralGravity: 0.1,
+                    springLength: 220,
+                    springConstant: 0.02,
+                    damping: 0.15,
+                    avoidOverlap: 0.8,
+                },
+                stabilization: { iterations: 200 },
             },
-            nodes: { borderWidth: 2, shadow: true },
+            nodes: {
+                borderWidth: 2,
+                shadow: { enabled: true, color: 'rgba(0,0,0,0.3)', size: 8 },
+            },
             edges: { width: 1.5 },
-            interaction: { hover: true, tooltipDelay: 100, multiselect: false },
+            interaction: {
+                hover: true,
+                tooltipDelay: 0,
+                hideEdgesOnDrag: true,
+                multiselect: false,
+            },
         });
 
-        // Click handler
+        this.entityMapNetwork = network;
+
+        // --- Hover: Fact Card tooltip ---
+        network.on('hoverNode', (params) => {
+            const raw = this._entityNodeMap.get(params.node);
+            if (!raw) return;
+            const canvasPos = params.pointer.DOM;
+            this.showEntityTooltip(raw, canvasPos.x, canvasPos.y);
+        });
+
+        network.on('blurNode', () => {
+            if (this.entityMapTooltip) this.entityMapTooltip.style.display = 'none';
+        });
+
+        // --- Click: detail sidebar ---
         network.on('click', (params) => {
             if (params.nodes.length > 0) {
-                const nodeId = params.nodes[0];
-                const node = data.nodes.find(n => n.id === nodeId);
-                if (node) {
-                    this.entityMapDetail.style.display = '';
-                    let html = `<strong>${this.escapeHtml(node.label)}</strong><br>`;
-                    if (node.type === 'person') {
-                        html += `<span style="color: var(--color-text-tertiary)">Email: ${this.escapeHtml(node.email)}</span><br>`;
-                        html += `<span style="color: var(--color-text-tertiary)">Emails in results: ${node.email_count}</span><br>`;
-                        // Find connected topics
-                        const connectedTopics = data.edges
-                            .filter(e => e.type === 'person_topic' && e.from === nodeId)
-                            .map(e => {
-                                const topic = data.nodes.find(n => n.id === e.to);
-                                return topic ? `${topic.label} (${e.weight})` : null;
-                            })
-                            .filter(Boolean);
-                        if (connectedTopics.length > 0) {
-                            html += `<br><strong>Topics:</strong><br>`;
-                            html += connectedTopics.map(t => `&bull; ${this.escapeHtml(t)}`).join('<br>');
-                        }
-                        // Find connected people
-                        const connectedPeople = data.edges
-                            .filter(e => e.type === 'person_person' && (e.from === nodeId || e.to === nodeId))
-                            .map(e => {
-                                const otherId = e.from === nodeId ? e.to : e.from;
-                                const other = data.nodes.find(n => n.id === otherId);
-                                return other ? `${other.label} (${e.weight} shared threads)` : null;
-                            })
-                            .filter(Boolean);
-                        if (connectedPeople.length > 0) {
-                            html += `<br><strong>Connected people:</strong><br>`;
-                            html += connectedPeople.map(p => `&bull; ${this.escapeHtml(p)}`).join('<br>');
-                        }
-                    } else {
-                        html += `<span style="color: var(--color-text-tertiary)">Messages: ${node.message_count}</span><br>`;
-                        // Find people involved in this topic
-                        const involvedPeople = data.edges
-                            .filter(e => e.type === 'person_topic' && e.to === nodeId)
-                            .map(e => {
-                                const person = data.nodes.find(n => n.id === e.from);
-                                return person ? `${person.label} (${e.weight} emails)` : null;
-                            })
-                            .filter(Boolean);
-                        if (involvedPeople.length > 0) {
-                            html += `<br><strong>People involved:</strong><br>`;
-                            html += involvedPeople.map(p => `&bull; ${this.escapeHtml(p)}`).join('<br>');
-                        }
-                    }
-                    this.entityMapDetail.innerHTML = html;
-                }
+                const raw = this._entityNodeMap.get(params.nodes[0]);
+                if (raw) this.showEntityDetail(raw, data);
             } else {
-                this.entityMapDetail.style.display = 'none';
+                if (this.entityMapDetail) this.entityMapDetail.style.display = 'none';
             }
         });
 
-        // Double-click to focus on a node's neighborhood
+        // --- Double-click to focus ---
         network.on('doubleClick', (params) => {
             if (params.nodes.length > 0) {
-                network.focus(params.nodes[0], { scale: 1.5, animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
+                network.focus(params.nodes[0], {
+                    scale: 1.5,
+                    animation: { duration: 500, easingFunction: 'easeInOutQuad' }
+                });
             }
+        });
+    }
+
+    showEntityTooltip(node, x, y) {
+        const tip = this.entityMapTooltip;
+        if (!tip) return;
+
+        let html = '<div class="tooltip-header">';
+        html += `<span class="tooltip-name">${this.escapeHtml(node.label)}</span>`;
+        if (node.tier) html += `<span class="tooltip-tier tier-${node.tier.toLowerCase()}">Tier ${node.tier}</span>`;
+        html += '</div>';
+
+        if (node.type === 'person') {
+            html += `<div class="tooltip-stat">${node.email_count} emails</div>`;
+            if (node.email) html += `<div class="tooltip-stat">${this.escapeHtml(node.email)}</div>`;
+            if (node.sentiments && node.sentiments.length > 0) {
+                html += '<div style="margin-top:4px;">';
+                node.sentiments.forEach(s => { html += `<span class="sentiment-tag ${s}">${s}</span>`; });
+                html += '</div>';
+            }
+            if (node.action_items && node.action_items.length > 0) {
+                html += '<div class="tooltip-actions"><strong style="font-size:0.7rem;color:var(--color-text-tertiary);text-transform:uppercase;">Action Items</strong>';
+                html += '<ul style="margin:2px 0;padding-left:16px;">';
+                node.action_items.slice(0, 3).forEach(item => {
+                    html += `<li>${this.escapeHtml(item)}</li>`;
+                });
+                if (node.action_items.length > 3) {
+                    html += `<li style="color:var(--color-text-tertiary);">+${node.action_items.length - 3} more...</li>`;
+                }
+                html += '</ul></div>';
+            }
+        } else if (node.type === 'organization') {
+            html += `<div class="tooltip-stat">${node.member_count} members &bull; ${node.email_count} emails</div>`;
+            html += `<div class="tooltip-stat">Domain: ${this.escapeHtml(node.domain)}</div>`;
+        } else {
+            html += `<div class="tooltip-stat">${node.message_count} messages</div>`;
+            if (node.subject) html += `<div class="tooltip-stat" style="font-style:italic;">${this.escapeHtml(node.subject)}</div>`;
+        }
+
+        tip.innerHTML = html;
+        tip.style.display = '';
+
+        // Position near cursor within graph bounds
+        const wrapper = tip.parentElement;
+        const wrapperRect = wrapper.getBoundingClientRect();
+        let left = x + 16;
+        let top = y - 10;
+        if (left + 340 > wrapperRect.width) left = x - 350;
+        if (left < 0) left = 8;
+        if (top + tip.offsetHeight > wrapperRect.height) top = wrapperRect.height - tip.offsetHeight - 8;
+        if (top < 0) top = 8;
+        tip.style.left = left + 'px';
+        tip.style.top = top + 'px';
+    }
+
+    showEntityDetail(node, data) {
+        if (!this.entityMapDetail) return;
+        this.entityMapDetail.style.display = '';
+        const content = this.entityMapDetailContent || this.entityMapDetail.querySelector('.detail-content');
+        if (!content) return;
+
+        let html = `<h3>${this.escapeHtml(node.label)}</h3>`;
+        if (node.tier) html += `<span class="tooltip-tier tier-${node.tier.toLowerCase()}" style="margin-bottom:8px;display:inline-block;">Tier ${node.tier}</span> `;
+
+        if (node.type === 'person') {
+            html += `<p style="color:var(--color-text-tertiary);font-size:0.8125rem;">${this.escapeHtml(node.email)}</p>`;
+            html += `<p style="color:var(--color-text-secondary);font-size:0.8125rem;">${node.email_count} emails</p>`;
+
+            if (node.sentiments && node.sentiments.length > 0) {
+                html += '<div style="margin:8px 0;">';
+                node.sentiments.forEach(s => { html += `<span class="sentiment-tag ${s}">${s}</span>`; });
+                html += '</div>';
+            }
+            if (node.action_items && node.action_items.length > 0) {
+                html += '<h4>Action Items</h4><ul style="padding-left:16px;font-size:0.8125rem;color:var(--color-text-secondary);">';
+                node.action_items.forEach(item => { html += `<li style="margin:4px 0;">${this.escapeHtml(item)}</li>`; });
+                html += '</ul>';
+            }
+
+            const connectedTopics = data.edges
+                .filter(e => e.type === 'person_topic' && e.from === node.id)
+                .map(e => { const t = data.nodes.find(n => n.id === e.to); return t ? `${t.label} (${e.weight})` : null; })
+                .filter(Boolean);
+            if (connectedTopics.length > 0) {
+                html += '<h4>Topics</h4>';
+                connectedTopics.forEach(t => { html += `<div style="font-size:0.8125rem;color:var(--color-text-secondary);padding:2px 0;">&bull; ${this.escapeHtml(t)}</div>`; });
+            }
+
+            const connectedPeople = data.edges
+                .filter(e => e.type === 'person_person' && (e.from === node.id || e.to === node.id))
+                .map(e => { const oid = e.from === node.id ? e.to : e.from; const o = data.nodes.find(n => n.id === oid); return o ? `${o.label} (${e.weight} shared)` : null; })
+                .filter(Boolean);
+            if (connectedPeople.length > 0) {
+                html += '<h4>Connected People</h4>';
+                connectedPeople.forEach(p => { html += `<div style="font-size:0.8125rem;color:var(--color-text-secondary);padding:2px 0;">&bull; ${this.escapeHtml(p)}</div>`; });
+            }
+        } else if (node.type === 'organization') {
+            html += `<p style="color:var(--color-text-tertiary);font-size:0.8125rem;">${this.escapeHtml(node.domain)}</p>`;
+            html += `<p style="color:var(--color-text-secondary);font-size:0.8125rem;">${node.member_count} members, ${node.email_count} emails</p>`;
+            if (node.members) {
+                html += '<h4>Members</h4>';
+                node.members.forEach(m => { html += `<div style="font-size:0.8125rem;color:var(--color-text-secondary);padding:2px 0;">&bull; ${this.escapeHtml(m)}</div>`; });
+            }
+        } else {
+            html += `<p style="color:var(--color-text-secondary);font-size:0.8125rem;">${node.message_count} messages</p>`;
+            const involved = data.edges
+                .filter(e => e.type === 'person_topic' && e.to === node.id)
+                .map(e => { const p = data.nodes.find(n => n.id === e.from); return p ? `${p.label} (${e.weight})` : null; })
+                .filter(Boolean);
+            if (involved.length > 0) {
+                html += '<h4>People Involved</h4>';
+                involved.forEach(p => { html += `<div style="font-size:0.8125rem;color:var(--color-text-secondary);padding:2px 0;">&bull; ${this.escapeHtml(p)}</div>`; });
+            }
+        }
+
+        content.innerHTML = html;
+    }
+
+    applyEntityMapFilters() {
+        if (!this.entityMapData || !this.entityMapNodeDataSet || !this.entityMapEdgeDataSet) return;
+
+        const { type, sentiment } = this.activeFilters;
+        const data = this.entityMapData;
+
+        const visibleNodeIds = new Set();
+        data.nodes.forEach(n => {
+            let show = true;
+            if (type === 'tier-a' && n.tier !== 'A') show = false;
+            if (type === 'people' && n.type !== 'person') show = false;
+            if (type === 'topics' && n.type !== 'topic') show = false;
+            if (type === 'orgs' && n.type !== 'organization') show = false;
+
+            if (sentiment !== 'all' && n.type === 'person') {
+                const sentiments = n.sentiments || [];
+                if (sentiment === 'urgent' && !sentiments.some(s => s === 'urgent' || s === 'risk')) show = false;
+                if (sentiment === 'waiting' && !sentiments.includes('waiting')) show = false;
+                if (sentiment === 'blocked' && !sentiments.includes('blocked')) show = false;
+            }
+
+            if (show) visibleNodeIds.add(n.id);
+        });
+
+        this.entityMapNodeDataSet.forEach(visNode => {
+            this.entityMapNodeDataSet.update({ id: visNode.id, hidden: !visibleNodeIds.has(visNode.id) });
+        });
+
+        this.entityMapEdgeDataSet.forEach(visEdge => {
+            const hidden = !visibleNodeIds.has(visEdge.from) || !visibleNodeIds.has(visEdge.to);
+            this.entityMapEdgeDataSet.update({ id: visEdge.id, hidden });
         });
     }
 

@@ -762,17 +762,16 @@ class RAGEngine:
         }
 
     def build_entity_map(self, subject: str) -> Dict[str, Any]:
-        """Build an entity relationship map showing people-to-people and people-to-topic connections."""
+        """Build an entity relationship map with tiered nodes, org detection, action items, and sentiment."""
         import itertools
+        from collections import defaultdict
 
         emails = self.vector_store.search(query=subject, n_results=75)
         emails = [e for e in emails if e.get('relevance', 0) > 0.2]
         emails_with_threads = self._expand_with_threads(emails)
 
-        # Normalize subject line
         def normalize_subject(s):
-            import re as _re
-            return _re.sub(r'^(RE:|Re:|FW:|Fwd:|re:|fw:)\s*', '', s).strip()
+            return re.sub(r'^(RE:|Re:|FW:|Fwd:|re:|fw:)\s*', '', s).strip()
 
         # Group by conversation_id
         threads = {}
@@ -784,13 +783,11 @@ class RAGEngine:
             else:
                 standalone.append(e)
 
-        # Track person data and topic data
-        person_email_counts = {}  # email_addr -> count
-        person_names = {}  # email_addr -> display name
-        topic_data = {}  # normalized_subject -> {conv_ids, message_count}
-        thread_participants = {}  # conv_id -> set of email addrs
+        person_email_counts = {}
+        person_names = {}
+        topic_data = {}
+        thread_participants = {}
 
-        # Process threaded emails
         for conv_id, thread_emails in threads.items():
             participants = set()
             for e in thread_emails:
@@ -798,105 +795,225 @@ class RAGEngine:
                 sender = meta.get('sender', '')
                 sender_name = meta.get('sender_name') or sender
                 subj = normalize_subject(meta.get('subject', ''))
-
                 if sender:
                     person_email_counts[sender] = person_email_counts.get(sender, 0) + 1
                     person_names[sender] = sender_name
                     participants.add(sender)
-
                 if subj:
                     if subj not in topic_data:
                         topic_data[subj] = {'conv_ids': set(), 'message_count': 0}
                     topic_data[subj]['conv_ids'].add(conv_id)
                     topic_data[subj]['message_count'] += 1
-
             thread_participants[conv_id] = participants
 
-        # Process standalone emails
         for e in standalone:
             meta = e.get('metadata', {})
             sender = meta.get('sender', '')
             sender_name = meta.get('sender_name') or sender
             subj = normalize_subject(meta.get('subject', ''))
-
             if sender:
                 person_email_counts[sender] = person_email_counts.get(sender, 0) + 1
                 person_names[sender] = sender_name
-
             if subj:
                 if subj not in topic_data:
                     topic_data[subj] = {'conv_ids': set(), 'message_count': 0}
                 topic_data[subj]['message_count'] += 1
 
-        # Build nodes
+        # --- Organization detection ---
+        IGNORED_DOMAINS = {'gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com',
+                           'live.com', 'aol.com', 'icloud.com', 'me.com', 'msn.com',
+                           'googlemail.com', 'protonmail.com'}
+        domain_people = defaultdict(set)
+        for email_addr in person_email_counts:
+            parts = email_addr.split('@')
+            if len(parts) == 2:
+                domain = parts[1].lower()
+                if domain not in IGNORED_DOMAINS:
+                    domain_people[domain].add(email_addr)
+
+        org_nodes = {}
+        for domain, members in domain_people.items():
+            if len(members) >= 2:
+                org_email_count = sum(person_email_counts.get(m, 0) for m in members)
+                org_nodes[domain] = {
+                    'id': f"org_{domain}",
+                    'label': domain.split('.')[0].title(),
+                    'type': 'organization',
+                    'domain': domain,
+                    'member_count': len(members),
+                    'email_count': org_email_count,
+                    'members': list(members),
+                }
+
+        # --- Tier assignment ---
+        all_counts = sorted(person_email_counts.values()) if person_email_counts else [1]
+        p66 = all_counts[int(len(all_counts) * 0.66)] if len(all_counts) >= 3 else max(all_counts)
+        p33 = all_counts[int(len(all_counts) * 0.33)] if len(all_counts) >= 3 else 1
+
+        def assign_tier(count):
+            if count >= p66:
+                return 'A'
+            elif count >= p33:
+                return 'B'
+            return 'C'
+
+        # --- Action item extraction and sentiment flags ---
+        ACTION_PATTERNS = [
+            re.compile(r'(?:^|\n)\s*(?:action[:\s]|todo[:\s]|to.do[:\s])(.+)', re.IGNORECASE),
+            re.compile(r'(?:please|pls|kindly)\s+(.{10,80}?)[\.\n]', re.IGNORECASE),
+            re.compile(r'(?:will|going to|need to|have to|must|should)\s+(.{10,80}?)[\.\n]', re.IGNORECASE),
+            re.compile(r'(?:deadline|due(?:\s+date)?)[:\s]+(.{5,60})', re.IGNORECASE),
+        ]
+        SENTIMENT_KEYWORDS = {
+            'urgent': 'urgent', 'asap': 'urgent', 'critical': 'urgent',
+            'risk': 'risk', 'blocked': 'blocked', 'blocker': 'blocked',
+            'overdue': 'overdue', 'waiting on': 'waiting', 'waiting for': 'waiting',
+            'no response': 'waiting',
+        }
+
+        person_action_items = defaultdict(list)
+        person_sentiments = defaultdict(set)
+
+        for e in emails_with_threads:
+            meta = e.get('metadata', {})
+            sender = meta.get('sender', '')
+            body = e.get('document', '')
+            if not sender or not body:
+                continue
+            for pattern in ACTION_PATTERNS:
+                for match in pattern.finditer(body):
+                    item = match.group(1).strip()[:120]
+                    if item and len(person_action_items[sender]) < 5:
+                        if item not in person_action_items[sender]:
+                            person_action_items[sender].append(item)
+            body_lower = body.lower()
+            for keyword, tag in SENTIMENT_KEYWORDS.items():
+                if keyword in body_lower:
+                    person_sentiments[sender].add(tag)
+
+        # --- Build nodes ---
         nodes = []
         node_ids = set()
 
         for email_addr, count in person_email_counts.items():
             nid = f"person_{email_addr}"
             node_ids.add(nid)
+            person_org = None
+            for domain, org_data in org_nodes.items():
+                if email_addr in org_data['members']:
+                    person_org = org_data['id']
+                    break
             nodes.append({
                 'id': nid,
                 'label': person_names.get(email_addr, email_addr),
                 'type': 'person',
                 'email': email_addr,
                 'email_count': count,
+                'tier': assign_tier(count),
+                'organization': person_org,
+                'action_items': person_action_items.get(email_addr, []),
+                'sentiments': list(person_sentiments.get(email_addr, [])),
             })
+
+        topic_counts = sorted([t['message_count'] for t in topic_data.values()]) if topic_data else [1]
+        tp66 = topic_counts[int(len(topic_counts) * 0.66)] if len(topic_counts) >= 3 else max(topic_counts)
+        tp33 = topic_counts[int(len(topic_counts) * 0.33)] if len(topic_counts) >= 3 else 1
 
         for subj, tdata in topic_data.items():
             nid = f"topic_{subj}"
             node_ids.add(nid)
+            mc = tdata['message_count']
+            tier = 'A' if mc >= tp66 else ('B' if mc >= tp33 else 'C')
             nodes.append({
                 'id': nid,
                 'label': subj[:50],
                 'type': 'topic',
                 'subject': subj,
-                'message_count': tdata['message_count'],
+                'message_count': mc,
+                'tier': tier,
             })
 
-        # Build edges
+        for domain, org_data in org_nodes.items():
+            org_data['tier'] = assign_tier(org_data['email_count'])
+            nodes.append(org_data)
+            node_ids.add(org_data['id'])
+
+        # --- Build edges ---
         edges = []
         edge_set = set()
 
-        # Person↔Person edges (shared threads)
-        person_pairs = {}  # (p1, p2) -> shared thread count
+        # Reply/quote counts per thread
+        thread_reply_counts = {}
+        thread_quote_counts = {}
+        for conv_id, thread_emails in threads.items():
+            replies = sum(1 for e in thread_emails if e.get('metadata', {}).get('is_replied'))
+            quotes = sum(1 for e in thread_emails if '>' in e.get('document', '')[:200])
+            thread_reply_counts[conv_id] = replies
+            thread_quote_counts[conv_id] = quotes
+
+        # Person↔Person edges
+        person_pair_threads = defaultdict(list)
         for conv_id, participants in thread_participants.items():
             for p1, p2 in itertools.combinations(sorted(participants), 2):
-                pair = (p1, p2)
-                person_pairs[pair] = person_pairs.get(pair, 0) + 1
+                person_pair_threads[(p1, p2)].append(conv_id)
 
-        for (p1, p2), weight in person_pairs.items():
+        for (p1, p2), conv_ids in person_pair_threads.items():
+            total_replies = sum(thread_reply_counts.get(c, 0) for c in conv_ids)
+            total_quotes = sum(thread_quote_counts.get(c, 0) for c in conv_ids)
             eid = f"person_{p1}<->person_{p2}"
             if eid not in edge_set:
                 edge_set.add(eid)
                 edges.append({
                     'from': f"person_{p1}",
                     'to': f"person_{p2}",
-                    'weight': weight,
+                    'weight': len(conv_ids),
                     'type': 'person_person',
-                    'label': str(weight),
+                    'label': str(len(conv_ids)),
+                    'thread_ids': conv_ids,
+                    'reply_count': total_replies,
+                    'quote_count': total_quotes,
                 })
 
         # Person→Topic edges
-        person_topic_counts = {}  # (email_addr, subject) -> count
+        person_topic_threads = defaultdict(lambda: {'count': 0, 'thread_ids': []})
         for e in emails_with_threads:
             meta = e.get('metadata', {})
             sender = meta.get('sender', '')
             subj = normalize_subject(meta.get('subject', ''))
+            conv_id = meta.get('conversation_id', '')
             if sender and subj and f"topic_{subj}" in node_ids:
                 key = (sender, subj)
-                person_topic_counts[key] = person_topic_counts.get(key, 0) + 1
+                person_topic_threads[key]['count'] += 1
+                if conv_id and conv_id not in person_topic_threads[key]['thread_ids']:
+                    person_topic_threads[key]['thread_ids'].append(conv_id)
 
-        for (email_addr, subj), weight in person_topic_counts.items():
+        for (email_addr, subj), data in person_topic_threads.items():
             eid = f"person_{email_addr}->topic_{subj}"
             if eid not in edge_set:
                 edge_set.add(eid)
                 edges.append({
                     'from': f"person_{email_addr}",
                     'to': f"topic_{subj}",
-                    'weight': weight,
+                    'weight': data['count'],
                     'type': 'person_topic',
+                    'thread_ids': data['thread_ids'],
                 })
+
+        # Person→Organization membership edges
+        for domain, org_data in org_nodes.items():
+            for member_email in org_data['members']:
+                person_nid = f"person_{member_email}"
+                if person_nid in node_ids:
+                    eid = f"{person_nid}->{org_data['id']}"
+                    if eid not in edge_set:
+                        edge_set.add(eid)
+                        edges.append({
+                            'from': person_nid,
+                            'to': org_data['id'],
+                            'weight': 1,
+                            'type': 'person_org',
+                            'thread_ids': [],
+                        })
 
         return {
             'nodes': nodes,
@@ -904,6 +1021,7 @@ class RAGEngine:
             'stats': {
                 'people': len([n for n in nodes if n['type'] == 'person']),
                 'topics': len([n for n in nodes if n['type'] == 'topic']),
+                'organizations': len([n for n in nodes if n['type'] == 'organization']),
                 'connections': len(edges),
                 'total_emails': len(emails),
             }
