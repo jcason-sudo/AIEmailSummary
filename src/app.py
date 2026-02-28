@@ -219,6 +219,20 @@ def topic_map():
     return jsonify(result)
 
 
+@app.route('/api/entity-map', methods=['POST'])
+def entity_map():
+    """Build an entity relationship map showing people and topic connections."""
+    data = request.json
+    subject = data.get('subject', '').strip()
+
+    if not subject:
+        return jsonify({'error': 'Subject required'}), 400
+
+    rag = get_rag_engine()
+    result = rag.build_entity_map(subject)
+    return jsonify(result)
+
+
 @app.route('/api/analytics')
 def analytics():
     """Get email analytics for charts."""
@@ -348,11 +362,24 @@ def debug_query():
 
 @app.route('/api/email/open', methods=['POST'])
 def open_email():
-    """Open an email in Outlook using EntryID or subject+sender search."""
+    """Open an email in Outlook or return a web link for IMAP-sourced emails."""
     data = request.json or {}
     message_id = data.get('message_id', '')
     subject = data.get('subject', '')
     sender = data.get('sender', '')
+    source = data.get('source', '')
+
+    # For IMAP-sourced emails, return a web link instead
+    if source in ('gmail', 'yahoo'):
+        if source == 'gmail':
+            # Gmail search URL
+            import urllib.parse
+            query = urllib.parse.quote(f'subject:"{subject}" from:{sender}' if sender else f'subject:"{subject}"')
+            return jsonify({'status': 'web', 'url': f'https://mail.google.com/mail/u/0/#search/{query}'})
+        elif source == 'yahoo':
+            import urllib.parse
+            query = urllib.parse.quote(subject or '')
+            return jsonify({'status': 'web', 'url': f'https://mail.yahoo.com/d/search/keyword={query}'})
 
     if not OUTLOOK_AVAILABLE:
         return jsonify({'error': 'Outlook not available'}), 400
@@ -373,19 +400,38 @@ def open_email():
             except Exception:
                 logger.debug(f"EntryID lookup failed for {message_id[:20]}...")
 
-        # Fallback: search by subject + sender in Inbox and Sent Items
+        # Fallback: search by subject in all default folders + subfolders
         if mail_item is None and subject:
+            safe_subject = subject.replace("'", "''")
+            # Search Inbox, Sent, and all configured folders
             for folder_id in [6, 5]:  # Inbox=6, Sent=5
                 try:
                     folder = namespace.GetDefaultFolder(folder_id)
                     items = folder.Items
-                    safe_subject = subject.replace("'", "''")
                     items = items.Restrict(f"[Subject] = '{safe_subject}'")
                     if items.Count > 0:
                         mail_item = items.GetFirst()
                         break
                 except Exception:
                     continue
+
+            # Also search subfolders by name from config
+            if mail_item is None:
+                for folder_name in config.OUTLOOK_FOLDERS:
+                    try:
+                        for store in namespace.Stores:
+                            root = store.GetRootFolder()
+                            folder = _find_folder(root, folder_name)
+                            if folder:
+                                items = folder.Items
+                                items = items.Restrict(f"[Subject] = '{safe_subject}'")
+                                if items.Count > 0:
+                                    mail_item = items.GetFirst()
+                                    break
+                        if mail_item:
+                            break
+                    except Exception:
+                        continue
 
         if mail_item:
             mail_item.Display()
@@ -396,6 +442,20 @@ def open_email():
     except Exception as e:
         logger.error(f"Failed to open email: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+def _find_folder(parent, target_name):
+    """Recursively search for a folder by name."""
+    try:
+        for folder in parent.Folders:
+            if folder.Name.lower() == target_name.lower():
+                return folder
+            result = _find_folder(folder, target_name)
+            if result:
+                return result
+    except:
+        pass
+    return None
 
 
 def run_server():

@@ -70,6 +70,14 @@ class InboxAI {
         this.researchThreads = document.getElementById('research-threads');
         this.researchTabs = document.getElementById('research-tabs');
 
+        // Entity Map
+        this.entityMapSubject = document.getElementById('entity-map-subject');
+        this.startEntityMapBtn = document.getElementById('start-entity-map');
+        this.entityMapStats = document.getElementById('entity-map-stats');
+        this.entityMapLegend = document.getElementById('entity-map-legend');
+        this.entityMapGraph = document.getElementById('entity-map-graph');
+        this.entityMapDetail = document.getElementById('entity-map-detail');
+
         // Charts
         this.charts = {};
 
@@ -128,6 +136,12 @@ class InboxAI {
                 document.getElementById('research-tab-analysis').style.display = tab === 'analysis' ? '' : 'none';
                 document.getElementById('research-tab-topicmap').style.display = tab === 'topicmap' ? '' : 'none';
             });
+        });
+
+        // Entity Map
+        this.startEntityMapBtn?.addEventListener('click', () => this.fetchEntityMap());
+        this.entityMapSubject?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') this.fetchEntityMap();
         });
 
         // Settings
@@ -270,7 +284,6 @@ class InboxAI {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let fullContent = '';
-            let sources = [];
             let refMap = {};
 
             while (true) {
@@ -293,8 +306,6 @@ class InboxAI {
                                 this.updateMessageContent(loadingEl, fullContent);
                             } else if (parsed.type === 'ref_map') {
                                 refMap = parsed.content;
-                            } else if (parsed.type === 'sources') {
-                                sources = parsed.content;
                             }
                         } catch (e) {
                             // Ignore parse errors
@@ -305,7 +316,7 @@ class InboxAI {
 
             // Finalize message with ref_map for clickable citations
             loadingEl.classList.remove('loading');
-            this.updateMessageContent(loadingEl, fullContent, sources, refMap);
+            this.updateMessageContent(loadingEl, fullContent, [], refMap);
 
         } catch (error) {
             console.error('Chat error:', error);
@@ -346,54 +357,8 @@ class InboxAI {
 
     updateMessageContent(messageEl, content, sources = [], refMap = {}) {
         const bubble = messageEl.querySelector('.message-bubble');
-        // Store refMap on the element for inline citation clicks
         messageEl._refMap = refMap;
         bubble.innerHTML = this.formatContent(content, refMap);
-
-        // Add sources if available
-        if (sources.length > 0) {
-            // Group sources by conversation_id for thread display
-            const threaded = {};
-            const standalone = [];
-            for (const s of sources) {
-                if (s.conversation_id) {
-                    if (!threaded[s.conversation_id]) {
-                        threaded[s.conversation_id] = [];
-                    }
-                    threaded[s.conversation_id].push(s);
-                } else {
-                    standalone.push(s);
-                }
-            }
-
-            const sourcesEl = document.createElement('div');
-            sourcesEl.className = 'message-sources';
-
-            let html = '';
-
-            // Show threaded sources as clickable tags
-            for (const [convId, threadSources] of Object.entries(threaded)) {
-                const s = threadSources[0];
-                const dataAttrs = `data-message-id="${this.escapeHtml(s.message_id || '')}" data-subject="${this.escapeHtml(s.subject || '')}" data-sender="${this.escapeHtml(s.sender || '')}"`;
-                html += `<span class="source-tag thread-tag clickable-source" ${dataAttrs} onclick="app.openEmail(this)">
-                    <span class="thread-icon">&#x1f4e7;</span>
-                    ${this.escapeHtml(s.subject || 'Thread')}
-                    <span class="thread-count">${threadSources.length} msgs</span>
-                </span>`;
-            }
-
-            // Show standalone sources as clickable tags
-            for (const s of standalone.slice(0, 5)) {
-                const dataAttrs = `data-message-id="${this.escapeHtml(s.message_id || '')}" data-subject="${this.escapeHtml(s.subject || '')}" data-sender="${this.escapeHtml(s.sender || '')}"`;
-                html += `<span class="source-tag clickable-source" ${dataAttrs} onclick="app.openEmail(this)">
-                    ${this.escapeHtml(s.sender || 'Unknown')}
-                    ${s.relevance ? `<span class="relevance">${s.relevance}%</span>` : ''}
-                </span>`;
-            }
-
-            sourcesEl.innerHTML = html;
-            messageEl.querySelector('.message-content').appendChild(sourcesEl);
-        }
     }
 
     formatContent(content, refMap = {}) {
@@ -420,7 +385,8 @@ class InboxAI {
                 const msgId = this.escapeHtml(ref.message_id || '');
                 const sender = this.escapeHtml(ref.sender || '');
                 const subjectFull = this.escapeHtml(ref.subject || '');
-                return `<span class="src-badge" title="${sender}: ${subjectFull}" data-message-id="${msgId}" data-subject="${subjectFull}" data-sender="${sender}" onclick="app.openEmail(this)">[${num}]</span>`;
+                const source = this.escapeHtml(ref.source || '');
+                return `<span class="src-badge" title="${sender}: ${subjectFull}" data-message-id="${msgId}" data-subject="${subjectFull}" data-sender="${sender}" data-source="${source}" onclick="app.openEmail(this)">[${num}]</span>`;
             }
             return `<span class="src-badge src-badge-unknown">[${num}]</span>`;
         });
@@ -439,26 +405,55 @@ class InboxAI {
         const messageId = element.dataset.messageId || '';
         const subject = element.dataset.subject || '';
         const sender = element.dataset.sender || '';
+        const source = element.dataset.source || '';
 
         if (!messageId && !subject) {
-            console.warn('No message_id or subject to open email');
             return;
         }
+
+        // Visual feedback
+        element.style.opacity = '0.5';
+        element.title = 'Opening...';
 
         try {
             const response = await fetch(`${this.apiBase}/api/email/open`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message_id: messageId, subject, sender })
+                body: JSON.stringify({ message_id: messageId, subject, sender, source })
             });
 
             const result = await response.json();
-            if (result.error) {
-                console.warn('Could not open email:', result.error);
+            if (result.status === 'web' && result.url) {
+                // IMAP email — open in browser
+                window.open(result.url, '_blank');
+                element.style.opacity = '1';
+                element.title = 'Opened in browser';
+            } else if (result.error) {
+                element.title = `Could not open: ${result.error}`;
+                element.style.opacity = '1';
+                element.style.background = '#ff4444';
+                setTimeout(() => { element.style.background = ''; }, 1500);
+            } else {
+                element.style.opacity = '1';
+                element.title = 'Opened in Outlook';
             }
         } catch (error) {
+            element.style.opacity = '1';
+            element.title = 'Failed to open email';
             console.error('Failed to open email:', error);
         }
+    }
+
+    formatLocalTime(isoStr) {
+        // Parse "2026-03-02T08:00:00" as local time, not UTC
+        const [, timePart] = isoStr.split('T');
+        if (!timePart) return '';
+        const [h, m] = timePart.split(':');
+        const hour = parseInt(h, 10);
+        const minute = m || '00';
+        const ampm = hour >= 12 ? 'PM' : 'AM';
+        const h12 = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
+        return `${h12}:${minute} ${ampm}`;
     }
 
     escapeHtml(text) {
@@ -636,8 +631,9 @@ class InboxAI {
                     const idx = data.meetings.findIndex(dm =>
                         dm.subject === m.subject && dm.start === m.start);
 
-                    const startTime = m.start ? new Date(m.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-                    const endTime = m.end ? new Date(m.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                    // Outlook returns local times as naive ISO strings — parse without timezone conversion
+                    const startTime = m.start ? this.formatLocalTime(m.start) : '';
+                    const endTime = m.end ? this.formatLocalTime(m.end) : '';
                     const attendeeCount = (m.all_attendees || []).length;
                     const attendeeList = (m.all_attendees || []).slice(0, 4).map(a => this.escapeHtml(a)).join(', ');
                     const moreAttendees = attendeeCount > 4 ? ` +${attendeeCount - 4} more` : '';
@@ -1156,6 +1152,187 @@ class InboxAI {
                 }
             } else {
                 detailPanel.style.display = 'none';
+            }
+        });
+    }
+
+    // Entity Relationship Map
+    async fetchEntityMap() {
+        const subject = this.entityMapSubject?.value.trim();
+        if (!subject) return;
+
+        this.entityMapStats.style.display = '';
+        this.entityMapLegend.style.display = '';
+        this.entityMapGraph.innerHTML = '<div class="loading-placeholder">Building entity map...</div>';
+        this.entityMapDetail.style.display = 'none';
+        document.getElementById('entity-people-count').textContent = '...';
+        document.getElementById('entity-topics-count').textContent = '...';
+        document.getElementById('entity-connections-count').textContent = '...';
+
+        try {
+            const response = await fetch(`${this.apiBase}/api/entity-map`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ subject })
+            });
+            const data = await response.json();
+
+            if (data.error) {
+                this.entityMapGraph.innerHTML = `<div class="empty-placeholder">${this.escapeHtml(data.error)}</div>`;
+                return;
+            }
+
+            // Update stats
+            const stats = data.stats || {};
+            document.getElementById('entity-people-count').textContent = stats.people || 0;
+            document.getElementById('entity-topics-count').textContent = stats.topics || 0;
+            document.getElementById('entity-connections-count').textContent = stats.connections || 0;
+
+            this.renderEntityMap(data);
+        } catch (error) {
+            console.error('Entity map error:', error);
+            this.entityMapGraph.innerHTML = '<div class="empty-placeholder">Error building entity map</div>';
+        }
+    }
+
+    renderEntityMap(data) {
+        if (!data.nodes || data.nodes.length === 0) {
+            this.entityMapGraph.innerHTML = '<div class="empty-placeholder">No entities found for this subject</div>';
+            return;
+        }
+        if (typeof vis === 'undefined') {
+            console.warn('vis-network not loaded');
+            return;
+        }
+
+        this.entityMapGraph.innerHTML = '';
+
+        const visNodes = data.nodes.map(n => {
+            if (n.type === 'person') {
+                const size = Math.min(10 + (n.email_count || 1) * 2, 40);
+                return {
+                    id: n.id,
+                    label: n.label,
+                    shape: 'dot',
+                    size: size,
+                    color: { background: '#8b5cf6', border: '#a78bfa', highlight: { background: '#a78bfa', border: '#c4b5fd' } },
+                    font: { color: '#f4f4f6', size: 12 },
+                    title: `${n.label}\n${n.email}\n${n.email_count} emails`,
+                };
+            } else {
+                const size = Math.min(10 + (n.message_count || 1) * 1.5, 35);
+                return {
+                    id: n.id,
+                    label: n.label,
+                    shape: 'box',
+                    size: size,
+                    color: { background: '#3b82f6', border: '#60a5fa', highlight: { background: '#60a5fa', border: '#93bbfd' } },
+                    font: { color: '#f4f4f6', size: 11, face: 'DM Sans' },
+                    title: `${n.subject}\n${n.message_count} messages`,
+                    widthConstraint: { maximum: 200 },
+                };
+            }
+        });
+
+        const visEdges = data.edges.map(e => {
+            if (e.type === 'person_person') {
+                return {
+                    from: e.from,
+                    to: e.to,
+                    width: Math.min(1 + e.weight, 6),
+                    label: e.weight > 1 ? String(e.weight) : '',
+                    color: { color: 'rgba(245, 158, 11, 0.5)', highlight: '#f59e0b' },
+                    font: { color: '#f59e0b', size: 10, strokeWidth: 0 },
+                    smooth: { type: 'continuous' },
+                };
+            } else {
+                return {
+                    from: e.from,
+                    to: e.to,
+                    width: Math.min(0.5 + (e.weight || 1) * 0.5, 4),
+                    color: { color: 'rgba(139, 92, 246, 0.2)', highlight: '#8b5cf6' },
+                    arrows: 'to',
+                    smooth: { type: 'continuous' },
+                };
+            }
+        });
+
+        const network = new vis.Network(this.entityMapGraph, {
+            nodes: new vis.DataSet(visNodes),
+            edges: new vis.DataSet(visEdges),
+        }, {
+            physics: {
+                solver: 'forceAtlas2Based',
+                forceAtlas2Based: { gravitationalConstant: -40, springLength: 120, springConstant: 0.04 },
+                stabilization: { iterations: 150 },
+            },
+            nodes: { borderWidth: 2, shadow: true },
+            edges: { width: 1.5 },
+            interaction: { hover: true, tooltipDelay: 100, multiselect: false },
+        });
+
+        // Click handler
+        network.on('click', (params) => {
+            if (params.nodes.length > 0) {
+                const nodeId = params.nodes[0];
+                const node = data.nodes.find(n => n.id === nodeId);
+                if (node) {
+                    this.entityMapDetail.style.display = '';
+                    let html = `<strong>${this.escapeHtml(node.label)}</strong><br>`;
+                    if (node.type === 'person') {
+                        html += `<span style="color: var(--color-text-tertiary)">Email: ${this.escapeHtml(node.email)}</span><br>`;
+                        html += `<span style="color: var(--color-text-tertiary)">Emails in results: ${node.email_count}</span><br>`;
+                        // Find connected topics
+                        const connectedTopics = data.edges
+                            .filter(e => e.type === 'person_topic' && e.from === nodeId)
+                            .map(e => {
+                                const topic = data.nodes.find(n => n.id === e.to);
+                                return topic ? `${topic.label} (${e.weight})` : null;
+                            })
+                            .filter(Boolean);
+                        if (connectedTopics.length > 0) {
+                            html += `<br><strong>Topics:</strong><br>`;
+                            html += connectedTopics.map(t => `&bull; ${this.escapeHtml(t)}`).join('<br>');
+                        }
+                        // Find connected people
+                        const connectedPeople = data.edges
+                            .filter(e => e.type === 'person_person' && (e.from === nodeId || e.to === nodeId))
+                            .map(e => {
+                                const otherId = e.from === nodeId ? e.to : e.from;
+                                const other = data.nodes.find(n => n.id === otherId);
+                                return other ? `${other.label} (${e.weight} shared threads)` : null;
+                            })
+                            .filter(Boolean);
+                        if (connectedPeople.length > 0) {
+                            html += `<br><strong>Connected people:</strong><br>`;
+                            html += connectedPeople.map(p => `&bull; ${this.escapeHtml(p)}`).join('<br>');
+                        }
+                    } else {
+                        html += `<span style="color: var(--color-text-tertiary)">Messages: ${node.message_count}</span><br>`;
+                        // Find people involved in this topic
+                        const involvedPeople = data.edges
+                            .filter(e => e.type === 'person_topic' && e.to === nodeId)
+                            .map(e => {
+                                const person = data.nodes.find(n => n.id === e.from);
+                                return person ? `${person.label} (${e.weight} emails)` : null;
+                            })
+                            .filter(Boolean);
+                        if (involvedPeople.length > 0) {
+                            html += `<br><strong>People involved:</strong><br>`;
+                            html += involvedPeople.map(p => `&bull; ${this.escapeHtml(p)}`).join('<br>');
+                        }
+                    }
+                    this.entityMapDetail.innerHTML = html;
+                }
+            } else {
+                this.entityMapDetail.style.display = 'none';
+            }
+        });
+
+        // Double-click to focus on a node's neighborhood
+        network.on('doubleClick', (params) => {
+            if (params.nodes.length > 0) {
+                network.focus(params.nodes[0], { scale: 1.5, animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
             }
         });
     }

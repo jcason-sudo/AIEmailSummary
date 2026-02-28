@@ -243,22 +243,9 @@ class RAGEngine:
             else:
                 yield {'type': 'chunk', 'content': chunk}
 
-        # Send ref_map so frontend can resolve [SRC-N] citations
+        # Send ref_map so frontend can resolve [SRC-N] inline citations
         if ref_map:
             yield {'type': 'ref_map', 'content': ref_map}
-
-        # Send sources at end
-        sources = [
-            {
-                'sender': e.get('metadata', {}).get('sender_name') or e.get('metadata', {}).get('sender', ''),
-                'subject': e.get('metadata', {}).get('subject', ''),
-                'date': e.get('metadata', {}).get('date', ''),
-                'conversation_id': e.get('metadata', {}).get('conversation_id', ''),
-                'message_id': e.get('metadata', {}).get('message_id', ''),
-            }
-            for e in emails[:10]
-        ]
-        yield {'type': 'sources', 'content': sources}
 
     def get_summary(self) -> Dict[str, Any]:
         """Get inbox summary."""
@@ -402,7 +389,8 @@ class RAGEngine:
 
         # Generate prep brief
         try:
-            brief = self.llm.generate_meeting_prep(meeting, emails_with_threads)
+            llm = self._get_llm('claude')
+            brief = llm.generate_meeting_prep(meeting, emails_with_threads)
         except Exception as e:
             logger.error(f"Meeting prep LLM error: {e}")
             brief = f"Error generating meeting prep: {e}"
@@ -459,8 +447,9 @@ class RAGEngine:
 
         emails_with_threads = self._expand_with_threads(all_emails)
 
-        # Stream the brief
-        for token in self.llm.generate_meeting_prep_stream(meeting, emails_with_threads):
+        # Stream the brief via Claude
+        llm = self._get_llm('claude')
+        for token in llm.generate_meeting_prep_stream(meeting, emails_with_threads):
             yield {'type': 'chunk', 'content': token}
 
         # Send metadata at end
@@ -769,6 +758,154 @@ class RAGEngine:
                 'people': len([n for n in nodes if n['type'] == 'person']),
                 'threads': len([n for n in nodes if n['type'] == 'thread']),
                 'standalone': len([n for n in nodes if n['type'] == 'email']),
+            }
+        }
+
+    def build_entity_map(self, subject: str) -> Dict[str, Any]:
+        """Build an entity relationship map showing people-to-people and people-to-topic connections."""
+        import itertools
+
+        emails = self.vector_store.search(query=subject, n_results=75)
+        emails = [e for e in emails if e.get('relevance', 0) > 0.2]
+        emails_with_threads = self._expand_with_threads(emails)
+
+        # Normalize subject line
+        def normalize_subject(s):
+            import re as _re
+            return _re.sub(r'^(RE:|Re:|FW:|Fwd:|re:|fw:)\s*', '', s).strip()
+
+        # Group by conversation_id
+        threads = {}
+        standalone = []
+        for e in emails_with_threads:
+            conv_id = e.get('metadata', {}).get('conversation_id', '')
+            if conv_id:
+                threads.setdefault(conv_id, []).append(e)
+            else:
+                standalone.append(e)
+
+        # Track person data and topic data
+        person_email_counts = {}  # email_addr -> count
+        person_names = {}  # email_addr -> display name
+        topic_data = {}  # normalized_subject -> {conv_ids, message_count}
+        thread_participants = {}  # conv_id -> set of email addrs
+
+        # Process threaded emails
+        for conv_id, thread_emails in threads.items():
+            participants = set()
+            for e in thread_emails:
+                meta = e.get('metadata', {})
+                sender = meta.get('sender', '')
+                sender_name = meta.get('sender_name') or sender
+                subj = normalize_subject(meta.get('subject', ''))
+
+                if sender:
+                    person_email_counts[sender] = person_email_counts.get(sender, 0) + 1
+                    person_names[sender] = sender_name
+                    participants.add(sender)
+
+                if subj:
+                    if subj not in topic_data:
+                        topic_data[subj] = {'conv_ids': set(), 'message_count': 0}
+                    topic_data[subj]['conv_ids'].add(conv_id)
+                    topic_data[subj]['message_count'] += 1
+
+            thread_participants[conv_id] = participants
+
+        # Process standalone emails
+        for e in standalone:
+            meta = e.get('metadata', {})
+            sender = meta.get('sender', '')
+            sender_name = meta.get('sender_name') or sender
+            subj = normalize_subject(meta.get('subject', ''))
+
+            if sender:
+                person_email_counts[sender] = person_email_counts.get(sender, 0) + 1
+                person_names[sender] = sender_name
+
+            if subj:
+                if subj not in topic_data:
+                    topic_data[subj] = {'conv_ids': set(), 'message_count': 0}
+                topic_data[subj]['message_count'] += 1
+
+        # Build nodes
+        nodes = []
+        node_ids = set()
+
+        for email_addr, count in person_email_counts.items():
+            nid = f"person_{email_addr}"
+            node_ids.add(nid)
+            nodes.append({
+                'id': nid,
+                'label': person_names.get(email_addr, email_addr),
+                'type': 'person',
+                'email': email_addr,
+                'email_count': count,
+            })
+
+        for subj, tdata in topic_data.items():
+            nid = f"topic_{subj}"
+            node_ids.add(nid)
+            nodes.append({
+                'id': nid,
+                'label': subj[:50],
+                'type': 'topic',
+                'subject': subj,
+                'message_count': tdata['message_count'],
+            })
+
+        # Build edges
+        edges = []
+        edge_set = set()
+
+        # Person↔Person edges (shared threads)
+        person_pairs = {}  # (p1, p2) -> shared thread count
+        for conv_id, participants in thread_participants.items():
+            for p1, p2 in itertools.combinations(sorted(participants), 2):
+                pair = (p1, p2)
+                person_pairs[pair] = person_pairs.get(pair, 0) + 1
+
+        for (p1, p2), weight in person_pairs.items():
+            eid = f"person_{p1}<->person_{p2}"
+            if eid not in edge_set:
+                edge_set.add(eid)
+                edges.append({
+                    'from': f"person_{p1}",
+                    'to': f"person_{p2}",
+                    'weight': weight,
+                    'type': 'person_person',
+                    'label': str(weight),
+                })
+
+        # Person→Topic edges
+        person_topic_counts = {}  # (email_addr, subject) -> count
+        for e in emails_with_threads:
+            meta = e.get('metadata', {})
+            sender = meta.get('sender', '')
+            subj = normalize_subject(meta.get('subject', ''))
+            if sender and subj and f"topic_{subj}" in node_ids:
+                key = (sender, subj)
+                person_topic_counts[key] = person_topic_counts.get(key, 0) + 1
+
+        for (email_addr, subj), weight in person_topic_counts.items():
+            eid = f"person_{email_addr}->topic_{subj}"
+            if eid not in edge_set:
+                edge_set.add(eid)
+                edges.append({
+                    'from': f"person_{email_addr}",
+                    'to': f"topic_{subj}",
+                    'weight': weight,
+                    'type': 'person_topic',
+                })
+
+        return {
+            'nodes': nodes,
+            'edges': edges,
+            'stats': {
+                'people': len([n for n in nodes if n['type'] == 'person']),
+                'topics': len([n for n in nodes if n['type'] == 'topic']),
+                'connections': len(edges),
+                'total_emails': len(emails),
             }
         }
 

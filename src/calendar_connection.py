@@ -127,11 +127,16 @@ class CalendarConnection:
                     item_start = None
                     item_end = None
                     try:
-                        item_start = datetime.fromtimestamp(item.Start.timestamp())
+                        # COM returns pywintypes.datetime (timezone-aware UTC)
+                        # Convert to local naive datetime by using .replace(tzinfo=None)
+                        # after converting to local time
+                        s = item.Start
+                        item_start = datetime(s.year, s.month, s.day, s.hour, s.minute, s.second)
                     except:
                         pass
                     try:
-                        item_end = datetime.fromtimestamp(item.End.timestamp())
+                        e = item.End
+                        item_end = datetime(e.year, e.month, e.day, e.hour, e.minute, e.second)
                     except:
                         pass
 

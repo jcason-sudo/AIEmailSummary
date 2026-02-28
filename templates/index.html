@@ -70,6 +70,16 @@
                     </svg>
                     <span>Research</span>
                 </button>
+                <button class="nav-item" data-view="entity-map">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="18" cy="5" r="3"/>
+                        <circle cx="6" cy="12" r="3"/>
+                        <circle cx="18" cy="19" r="3"/>
+                        <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                        <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+                    </svg>
+                    <span>Entity Map</span>
+                </button>
                 <button class="nav-item" data-view="settings">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="12" cy="12" r="3"/>
@@ -499,6 +509,83 @@
                         </div>
                         <div id="topic-map-detail" class="topic-map-detail" style="display:none;"></div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Entity Map View -->
+            <div class="view" id="entity-map-view">
+                <div class="dashboard-container">
+                    <header class="dashboard-header">
+                        <h1>Entity Relationship Map</h1>
+                    </header>
+
+                    <div class="research-input-wrapper">
+                        <input type="text" id="entity-map-subject" placeholder="Enter a subject to map relationships..." autocomplete="off">
+                        <button id="start-entity-map" class="btn-primary">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="18" cy="5" r="3"/>
+                                <circle cx="6" cy="12" r="3"/>
+                                <circle cx="18" cy="19" r="3"/>
+                                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+                            </svg>
+                            Map
+                        </button>
+                    </div>
+
+                    <div id="entity-map-stats" class="stats-grid" style="display:none;">
+                        <div class="stat-card">
+                            <div class="stat-icon blue">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                                    <circle cx="12" cy="7" r="4"/>
+                                </svg>
+                            </div>
+                            <div class="stat-content">
+                                <span class="stat-value" id="entity-people-count">0</span>
+                                <span class="stat-label">People</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon green">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                                    <polyline points="22,6 12,13 2,6"/>
+                                </svg>
+                            </div>
+                            <div class="stat-content">
+                                <span class="stat-value" id="entity-topics-count">0</span>
+                                <span class="stat-label">Topics</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon yellow">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="18" cy="5" r="3"/>
+                                    <circle cx="6" cy="12" r="3"/>
+                                    <circle cx="18" cy="19" r="3"/>
+                                    <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                                    <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+                                </svg>
+                            </div>
+                            <div class="stat-content">
+                                <span class="stat-value" id="entity-connections-count">0</span>
+                                <span class="stat-label">Connections</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="entity-map-legend" id="entity-map-legend" style="display:none;">
+                        <span class="legend-item"><span class="legend-dot" style="background:#8b5cf6;"></span> Person</span>
+                        <span class="legend-item"><span class="legend-dot" style="background:#3b82f6;"></span> Topic</span>
+                        <span class="legend-item"><span class="legend-dot" style="background:#f59e0b;"></span> Shared threads</span>
+                    </div>
+
+                    <div id="entity-map-graph" class="entity-map-container">
+                        <div class="loading-placeholder">Enter a subject and click "Map" to visualize relationships</div>
+                    </div>
+
+                    <div id="entity-map-detail" class="entity-map-detail" style="display:none;"></div>
                 </div>
             </div>
 

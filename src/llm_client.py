@@ -43,7 +43,10 @@ SOURCE CITATIONS:
 - Example: "The deadline for the proposal is March 15th [SRC-3]"
 - Always cite sources so the user can verify information
 
-Current date: {current_time}
+DATE AWARENESS:
+- Current date and time: {current_time}
+- When the user says "Monday", "next Tuesday", "this week", "last Friday", etc., interpret relative to the current date above
+- Always be specific about which calendar date you're referring to
 """
 
     RESEARCH_PROMPT = """You are a deep research analyst examining a corpus of emails about a specific topic.
@@ -182,6 +185,7 @@ Thread Status: {thread_status} | Messages: {len(thread_emails)}
                     'sender': meta.get('sender_name') or meta.get('sender', ''),
                     'date': meta.get('date', ''),
                     'message_id': meta.get('message_id', ''),
+                    'source': meta.get('source', ''),
                 }
                 parts.append(f"""
 --- Message [SRC-{idx}] in thread ---
@@ -196,6 +200,7 @@ Thread Status: {thread_status} | Messages: {len(thread_emails)}
                 'sender': meta.get('sender_name') or meta.get('sender', ''),
                 'date': meta.get('date', ''),
                 'message_id': meta.get('message_id', ''),
+                'source': meta.get('source', ''),
             }
             parts.append(f"""
 ================================================================================
@@ -249,7 +254,7 @@ Please let the user know that no relevant emails were found and suggest they may
             end=meeting.get('end', ''),
             attendees=attendees or 'Not specified',
             location=meeting.get('location', 'Not specified'),
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            current_time=datetime.now().strftime("%A, %B %d, %Y %H:%M"),
         )
 
         if email_context:
@@ -269,7 +274,7 @@ Please prepare the meeting brief based on these emails."""
     def _build_research_prompt(self, topic: str, email_context: List[Dict[str, Any]], max_content_chars: int = 2500) -> tuple:
         """Build the research prompt from topic and email context. Returns (system, prompt, ref_map)."""
         system = self.RESEARCH_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+            current_time=datetime.now().strftime("%A, %B %d, %Y %H:%M")
         )
         context_str, ref_map = self._format_email_context(email_context, max_content_chars)
         prompt = f"""Research topic: "{topic}"
@@ -429,7 +434,7 @@ class LlamaCppClient(BaseLLMClient):
              max_content_chars: int = 1000) -> tuple:
         """Send message, get response. Returns (answer, ref_map)."""
         system = self.SYSTEM_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+            current_time=datetime.now().strftime("%A, %B %d, %Y %H:%M")
         )
         prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
         logger.debug(f"Prompt length: {len(prompt)} chars")
@@ -442,7 +447,7 @@ class LlamaCppClient(BaseLLMClient):
                     max_content_chars: int = 1000) -> Generator:
         """Stream response chunks. Yields tokens, then a final dict with ref_map."""
         system = self.SYSTEM_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+            current_time=datetime.now().strftime("%A, %B %d, %Y %H:%M")
         )
         prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
         yield from self._stream_tokens_with_retry(system, prompt, email_context)
@@ -518,7 +523,7 @@ class ClaudeClient(BaseLLMClient):
              max_content_chars: int = 2500) -> tuple:
         """Send message, get response via Claude API. Returns (answer, ref_map)."""
         system = self.SYSTEM_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+            current_time=datetime.now().strftime("%A, %B %d, %Y %H:%M")
         )
         prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
         logger.debug(f"Claude prompt length: {len(prompt)} chars")
@@ -538,7 +543,7 @@ class ClaudeClient(BaseLLMClient):
                     max_content_chars: int = 2500) -> Generator:
         """Stream response chunks via Claude API. Yields tokens, then ref_map dict."""
         system = self.SYSTEM_PROMPT.format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+            current_time=datetime.now().strftime("%A, %B %d, %Y %H:%M")
         )
         prompt, ref_map = self._build_prompt(user_message, email_context, max_content_chars)
 

@@ -25,11 +25,13 @@ IMAP_SERVERS = {
     'hotmail': {'host': 'outlook.office365.com', 'port': 993},
 }
 
-# Default folders to fetch per provider
-DEFAULT_FOLDERS = {
-    'gmail': ['INBOX', '[Gmail]/Sent Mail'],
-    'yahoo': ['Inbox', 'Sent'],
-    'default': ['INBOX', 'Sent'],
+# Folders to skip (trash, spam, drafts are noise)
+SKIP_FOLDERS = {
+    'trash', 'deleted', 'deleted items', 'deleted messages',
+    'spam', 'junk', 'bulk',
+    'drafts', 'draft',
+    '[gmail]/trash', '[gmail]/spam', '[gmail]/drafts',
+    '[gmail]/all mail',  # skip — already covered by individual folders
 }
 
 
@@ -63,10 +65,68 @@ def _parse_address_list(header_value: str) -> List[str]:
     return [addr for _, addr in addresses if addr]
 
 
+def _parse_icalendar(ical_text: str) -> str:
+    """Extract readable info from iCalendar (text/calendar) data."""
+    lines = ical_text.splitlines()
+    info = {}
+    description_lines = []
+    in_description = False
+
+    for line in lines:
+        if in_description:
+            if line.startswith(' ') or line.startswith('\t'):
+                description_lines.append(line.strip())
+                continue
+            else:
+                in_description = False
+                info['description'] = ' '.join(description_lines)
+
+        if line.startswith('SUMMARY:'):
+            info['summary'] = line[8:].strip()
+        elif line.startswith('DTSTART'):
+            val = line.split(':', 1)[-1].strip()
+            info['start'] = val
+        elif line.startswith('DTEND'):
+            val = line.split(':', 1)[-1].strip()
+            info['end'] = val
+        elif line.startswith('LOCATION:'):
+            info['location'] = line[9:].strip()
+        elif line.startswith('ORGANIZER'):
+            val = line.split(':', 1)[-1].strip().replace('mailto:', '')
+            info['organizer'] = val
+        elif line.startswith('ATTENDEE'):
+            val = line.split(':', 1)[-1].strip().replace('mailto:', '')
+            info.setdefault('attendees', []).append(val)
+        elif line.startswith('DESCRIPTION:'):
+            in_description = True
+            description_lines = [line[12:].strip()]
+
+    if not info:
+        return ""
+
+    parts = ["[Calendar Event]"]
+    if 'summary' in info:
+        parts.append(f"Event: {info['summary']}")
+    if 'start' in info:
+        parts.append(f"Start: {info['start']}")
+    if 'end' in info:
+        parts.append(f"End: {info['end']}")
+    if 'location' in info:
+        parts.append(f"Location: {info['location']}")
+    if 'organizer' in info:
+        parts.append(f"Organizer: {info['organizer']}")
+    if 'attendees' in info:
+        parts.append(f"Attendees: {', '.join(info['attendees'][:10])}")
+    if 'description' in info:
+        parts.append(f"Details: {info['description'][:500]}")
+    return '\n'.join(parts)
+
+
 def _get_body(msg) -> tuple:
-    """Extract plain text and HTML body from an email message."""
+    """Extract plain text, HTML body, and calendar data from an email message."""
     body_text = ""
     body_html = ""
+    calendar_text = ""
 
     if msg.is_multipart():
         for part in msg.walk():
@@ -84,6 +144,8 @@ def _get_body(msg) -> tuple:
                     body_text = text
                 elif content_type == 'text/html' and not body_html:
                     body_html = text
+                elif content_type == 'text/calendar' and not calendar_text:
+                    calendar_text = _parse_icalendar(text)
             except Exception:
                 continue
     else:
@@ -97,6 +159,8 @@ def _get_body(msg) -> tuple:
                     body_text = text
                 elif content_type == 'text/html':
                     body_html = text
+                elif content_type == 'text/calendar':
+                    calendar_text = _parse_icalendar(text)
         except Exception:
             pass
 
@@ -110,6 +174,13 @@ def _get_body(msg) -> tuple:
             body_text = converter.handle(body_html)
         except Exception:
             body_text = body_html
+
+    # Append calendar info to body so it's searchable
+    if calendar_text:
+        if body_text:
+            body_text = body_text + "\n\n" + calendar_text
+        else:
+            body_text = calendar_text
 
     return body_text, body_html
 
@@ -153,7 +224,7 @@ class IMAPConnection:
         self.disconnect()
 
     def list_folders(self) -> List[str]:
-        """List all available folders."""
+        """List all available folders including subfolders."""
         if not self.conn:
             return []
         try:
@@ -163,17 +234,38 @@ class IMAPConnection:
             folders = []
             for item in folder_data:
                 if isinstance(item, bytes):
-                    # Parse folder name from IMAP LIST response
-                    parts = item.decode('utf-8', errors='replace').split('"')
-                    if len(parts) >= 3:
-                        folders.append(parts[-2])
+                    decoded = item.decode('utf-8', errors='replace')
+                    # IMAP LIST format: (\Flags) "delimiter" "folder name"
+                    # Find the last quoted string or unquoted name
+                    import re
+                    match = re.search(r'"([^"]*)"$', decoded)
+                    if match:
+                        folders.append(match.group(1))
                     else:
-                        name = item.decode('utf-8', errors='replace').rsplit(' ', 1)[-1]
-                        folders.append(name.strip('"'))
+                        name = decoded.rsplit(' ', 1)[-1].strip('"')
+                        folders.append(name)
             return folders
         except Exception as e:
             logger.error(f"Failed to list folders: {e}")
             return []
+
+    def get_all_folders(self) -> List[str]:
+        """Get all folders worth ingesting (skips trash, spam, drafts)."""
+        all_folders = self.list_folders()
+        result = []
+        for f in all_folders:
+            if f.lower() in SKIP_FOLDERS:
+                continue
+            # Also skip by partial match for provider-specific naming
+            lower = f.lower()
+            if any(skip in lower for skip in ['trash', 'spam', 'junk', 'bulk']):
+                continue
+            # Skip IMAP internal folders
+            if lower.startswith('[gmail]/') and lower == '[gmail]':
+                continue
+            result.append(f)
+        logger.info(f"Discovered {len(result)} folders for {self.label}: {result}")
+        return result
 
     def _is_sent_folder(self, folder_name: str) -> bool:
         """Check if folder is a sent folder."""
@@ -303,7 +395,7 @@ class IMAPConnection:
             return
 
         if folders is None:
-            folders = DEFAULT_FOLDERS.get(self.provider, DEFAULT_FOLDERS['default'])
+            folders = self.get_all_folders()
 
         for folder_name in folders:
             try:
