@@ -494,7 +494,7 @@ class InboxAI {
     // Meetings
     async loadMeetings() {
         try {
-            const response = await fetch(`${this.apiBase}/api/meetings?days=7`);
+            const response = await fetch(`${this.apiBase}/api/meetings?days=5`);
             const data = await response.json();
 
             if (data.error) {
@@ -507,7 +507,7 @@ class InboxAI {
                 : '';
 
             if (!data.meetings || data.meetings.length === 0) {
-                this.meetingsList.innerHTML = '<div class="empty-placeholder">No meetings scheduled in the next 7 days</div>';
+                this.meetingsList.innerHTML = '<div class="empty-placeholder">No meetings scheduled in the next 5 business days</div>';
                 return;
             }
 

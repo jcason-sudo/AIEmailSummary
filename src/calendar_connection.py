@@ -241,16 +241,28 @@ class CalendarConnection:
             'meetings': meetings,
         }
 
-    def get_upcoming_meetings(self, days: int = 7) -> dict:
-        """Get meetings for the next N days including recurring meetings.
+    def get_upcoming_meetings(self, days: int = 5) -> dict:
+        """Get meetings from now through the next N business days.
 
         IncludeRecurrences is already set in get_meetings(), so recurring
         meetings created long ago will appear as expanded occurrences within
         the date range.
+
+        Args:
+            days: Number of business days to look ahead (default 5 = one work week).
         """
-        today = datetime.now()
-        start = today.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        end = start + timedelta(days=days)
+        now = datetime.now()
+        start = now  # Include meetings starting from right now
+
+        # Calculate end date: skip weekends to cover N business days
+        end = now
+        bdays = 0
+        while bdays < days:
+            end += timedelta(days=1)
+            if end.weekday() < 5:  # Mon-Fri
+                bdays += 1
+        # Set end to end-of-day on the last business day
+        end = end.replace(hour=23, minute=59, second=59, microsecond=0)
 
         meetings = self.get_meetings(start, end)
 
@@ -275,7 +287,7 @@ class CalendarConnection:
         }
 
 
-def get_calendar_meetings(days: int = 7) -> dict:
+def get_calendar_meetings(days: int = 5) -> dict:
     """Convenience function to get upcoming meetings."""
     if not CALENDAR_AVAILABLE:
         return {

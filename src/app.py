@@ -150,7 +150,7 @@ def tasks():
 @app.route('/api/meetings')
 def meetings():
     """Get upcoming meetings from Outlook Calendar."""
-    days = request.args.get('days', 7, type=int)
+    days = request.args.get('days', 5, type=int)
     rag = get_rag_engine()
     return jsonify(rag.get_meetings(days=days))
 
