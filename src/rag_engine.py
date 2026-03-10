@@ -8,7 +8,9 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
 from vector_store import get_vector_store
+from hybrid_search import get_hybrid_search
 from llm_client import get_ollama_client, get_llm_client
+from fact_store import get_fact_store
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,7 @@ class RAGEngine:
 
     def __init__(self):
         self.vector_store = get_vector_store()
+        self.hybrid = get_hybrid_search()
         self.llm = get_ollama_client()
 
     def _parse_time_reference(self, query: str) -> Optional[Tuple[datetime, datetime]]:
@@ -139,6 +142,39 @@ class RAGEngine:
 
         return expanded
 
+    def _get_fact_context(self, query: str) -> str:
+        """Get relevant fact card data to augment query context."""
+        try:
+            fact_store = get_fact_store()
+            if fact_store.get_extracted_count() == 0:
+                return ""
+
+            q = query.lower()
+            parts = []
+
+            # Check for commitment/promise queries
+            if any(w in q for w in ['commit', 'promise', 'agreed', 'will do', 'pledged']):
+                commitments = fact_store.get_commitments()
+                if commitments:
+                    parts.append("EXTRACTED COMMITMENTS:")
+                    for c in commitments[:15]:
+                        parts.append(f"  - {c['who']}: {c['what']}" + (f" (by {c['by_when']})" if c['by_when'] else ""))
+
+            # Check for action item queries
+            if any(w in q for w in ['action', 'todo', 'task', 'need to', 'should do']):
+                actions = fact_store.get_action_items()
+                if actions:
+                    parts.append("EXTRACTED ACTION ITEMS:")
+                    for a in actions[:15]:
+                        parts.append(f"  - {a['description']}" + (f" (assigned: {a['assignee']})" if a['assignee'] else ""))
+
+            if parts:
+                return "\n\nSTRUCTURED DATA FROM EMAIL ANALYSIS:\n" + "\n".join(parts) + "\n"
+        except Exception as e:
+            logger.debug(f"Fact context lookup failed: {e}")
+
+        return ""
+
     # Backend-specific context limits
     CONTEXT_LIMITS = {
         'claude': {'n_results': 30, 'max_content_chars': 2500},
@@ -166,8 +202,8 @@ class RAGEngine:
         time_range = self._parse_time_reference(user_query)
         where = self._build_where_filter(query_info, time_range)
 
-        # Retrieve relevant emails
-        emails = self.vector_store.search(
+        # Retrieve relevant emails via hybrid search (BM25 + semantic + reranking)
+        emails = self.hybrid.search(
             query=user_query,
             n_results=n_results,
             where=where
@@ -226,7 +262,7 @@ class RAGEngine:
         time_range = self._parse_time_reference(user_query)
         where = self._build_where_filter(query_info, time_range)
 
-        emails = self.vector_store.search(query=user_query, n_results=n_results, where=where)
+        emails = self.hybrid.search(query=user_query, n_results=n_results, where=where)
 
         # Expand with full thread context
         emails_with_threads = self._expand_with_threads(emails)
@@ -284,16 +320,17 @@ class RAGEngine:
         }
 
     def get_tasks(self) -> Dict[str, Any]:
-        """Get categorized open action items with thread context."""
+        """Get categorized open action items using deterministic state engine."""
+        from state_engine import get_state_engine
 
-        # Get all open items from vector store
-        open_items = self.vector_store.get_open_items()
+        engine = get_state_engine()
+        states = engine.get_all_thread_states(self.vector_store)
 
-        # Separate by status
-        needs_action = [item for item in open_items if item['status'] == 'needs_action']
-        awaiting_response = [item for item in open_items if item['status'] == 'awaiting_response']
+        needs_action = states.get('needs_action', [])
+        awaiting_response = states.get('awaiting_response', [])
+        stale = states.get('stale', [])
 
-        # Use semantic search to find deadline/question emails
+        # Use semantic search to tag deadline/question emails
         deadline_emails = self.vector_store.search(
             query="deadline due date by end of urgent asap",
             n_results=10,
@@ -306,20 +343,15 @@ class RAGEngine:
             where={"$and": [{"direction": "received"}, {"is_replied": False}]}
         )
 
-        # Build sets of subjects that match deadline/question patterns
-        deadline_subjects = set()
-        for e in deadline_emails:
-            subj = e.get('metadata', {}).get('subject', '')
-            if subj:
-                deadline_subjects.add(subj)
+        deadline_subjects = set(
+            e.get('metadata', {}).get('subject', '') for e in deadline_emails
+            if e.get('metadata', {}).get('subject')
+        )
+        question_subjects = set(
+            e.get('metadata', {}).get('subject', '') for e in question_emails
+            if e.get('metadata', {}).get('subject')
+        )
 
-        question_subjects = set()
-        for e in question_emails:
-            subj = e.get('metadata', {}).get('subject', '')
-            if subj:
-                question_subjects.add(subj)
-
-        # Tag items
         for item in needs_action:
             item['tags'] = []
             if item['subject'] in deadline_subjects:
@@ -330,10 +362,12 @@ class RAGEngine:
         return {
             'needs_action': needs_action,
             'awaiting_response': awaiting_response,
-            'total_open': len(needs_action) + len(awaiting_response),
+            'stale': stale,
+            'total_open': len(needs_action) + len(awaiting_response) + len(stale),
             'summary': {
                 'needs_action_count': len(needs_action),
                 'awaiting_response_count': len(awaiting_response),
+                'stale_count': len(stale),
                 'with_deadlines': len([i for i in needs_action if 'deadline' in i.get('tags', [])]),
                 'with_questions': len([i for i in needs_action if 'question' in i.get('tags', [])]),
             }
@@ -363,20 +397,20 @@ class RAGEngine:
 
         # Search 1: by meeting subject
         if subject:
-            results = self.vector_store.search(query=subject, n_results=10)
+            results = self.hybrid.search(query=subject, n_results=10)
             add_results(results)
 
         # Search 2: by attendee names (top 3 to avoid too many queries)
         for attendee in attendees[:3]:
             if attendee:
-                results = self.vector_store.search(query=attendee, n_results=5)
+                results = self.hybrid.search(query=attendee, n_results=5, rerank=False)
                 add_results(results)
 
         # Search 3: meeting summary + subject (catches Zoom AI summaries via email)
         if subject:
-            results = self.vector_store.search(
+            results = self.hybrid.search(
                 query=f"meeting summary notes {subject}",
-                n_results=5
+                n_results=5, rerank=False
             )
             add_results(results)
 
@@ -438,12 +472,12 @@ class RAGEngine:
                     all_emails.append(r)
 
         if subject:
-            add_results(self.vector_store.search(query=subject, n_results=10))
+            add_results(self.hybrid.search(query=subject, n_results=10))
         for attendee in attendees[:3]:
             if attendee:
-                add_results(self.vector_store.search(query=attendee, n_results=5))
+                add_results(self.hybrid.search(query=attendee, n_results=5, rerank=False))
         if subject:
-            add_results(self.vector_store.search(query=f"meeting summary notes {subject}", n_results=5))
+            add_results(self.hybrid.search(query=f"meeting summary notes {subject}", n_results=5, rerank=False))
 
         emails_with_threads = self._expand_with_threads(all_emails)
 
@@ -471,8 +505,8 @@ class RAGEngine:
         """Perform deep research on a topic across all related emails."""
         limits = self._get_limits(backend)
 
-        # Broad semantic search
-        emails = self.vector_store.search(query=topic, n_results=50)
+        # Broad hybrid search
+        emails = self.hybrid.search(query=topic, n_results=50, rerank=False)
 
         # Filter to relevance > 0.3
         emails = [e for e in emails if e.get('relevance', 0) > 0.3]
@@ -563,8 +597,8 @@ class RAGEngine:
         """Stream deep research synthesis, then send timeline metadata."""
         limits = self._get_limits(backend)
 
-        # Broad semantic search
-        emails = self.vector_store.search(query=topic, n_results=50)
+        # Broad hybrid search
+        emails = self.hybrid.search(query=topic, n_results=50, rerank=False)
         emails = [e for e in emails if e.get('relevance', 0) > 0.3]
 
         # Expand with full thread context
@@ -650,7 +684,7 @@ class RAGEngine:
 
     def build_topic_map(self, topic: str) -> Dict[str, Any]:
         """Build an interactive topic map showing connections between emails and people."""
-        emails = self.vector_store.search(query=topic, n_results=50)
+        emails = self.hybrid.search(query=topic, n_results=50, rerank=False)
         emails = [e for e in emails if e.get('relevance', 0) > 0.25]
 
         # Expand with threads
@@ -766,12 +800,40 @@ class RAGEngine:
         import itertools
         from collections import defaultdict
 
-        emails = self.vector_store.search(query=subject, n_results=75)
-        emails = [e for e in emails if e.get('relevance', 0) > 0.2]
-        emails_with_threads = self._expand_with_threads(emails)
+        # Use reranking for precision — only keep genuinely relevant emails
+        emails = self.hybrid.search(query=subject, n_results=30, rerank=True)
+        emails = [e for e in emails if e.get('relevance', 0) > 0.45]
+
+        if not emails:
+            return {'nodes': [], 'edges': [], 'stats': {
+                'people': 0, 'topics': 0, 'organizations': 0,
+                'connections': 0, 'total_emails': 0,
+            }}
+
+        # Only expand threads for high-relevance results (top half)
+        top_emails = emails[:len(emails) // 2 + 1]
+        emails_with_threads = self._expand_with_threads(top_emails)
+        # Add remaining emails without thread expansion
+        seen = {e.get('id', '') for e in emails_with_threads}
+        for e in emails:
+            if e.get('id', '') not in seen:
+                emails_with_threads.append(e)
+                seen.add(e.get('id', ''))
 
         def normalize_subject(s):
             return re.sub(r'^(RE:|Re:|FW:|Fwd:|re:|fw:)\s*', '', s).strip()
+
+        # Check if a topic subject is related to the search query
+        query_terms = set(subject.lower().split())
+
+        def is_relevant_topic(subj):
+            """Only include topics whose subject mentions the search term."""
+            subj_lower = subj.lower()
+            # Check if any query term appears in the subject
+            for term in query_terms:
+                if len(term) >= 2 and term in subj_lower:
+                    return True
+            return False
 
         # Group by conversation_id
         threads = {}
@@ -788,18 +850,26 @@ class RAGEngine:
         topic_data = {}
         thread_participants = {}
 
+        def norm_email(addr):
+            """Normalize email/Exchange DN to lowercase for dedup."""
+            return addr.strip().lower()
+
         for conv_id, thread_emails in threads.items():
             participants = set()
             for e in thread_emails:
                 meta = e.get('metadata', {})
-                sender = meta.get('sender', '')
-                sender_name = meta.get('sender_name') or sender
+                sender = norm_email(meta.get('sender', ''))
+                sender_name = meta.get('sender_name') or meta.get('sender', '')
                 subj = normalize_subject(meta.get('subject', ''))
-                if sender:
+                is_meeting = meta.get('email_type') == 'meeting_note'
+                # Don't treat bot senders as people, but keep topic tracking
+                if sender and not is_meeting:
                     person_email_counts[sender] = person_email_counts.get(sender, 0) + 1
-                    person_names[sender] = sender_name
+                    # Keep the best display name (prefer non-empty, non-email)
+                    if sender_name and (sender not in person_names or person_names[sender] == sender):
+                        person_names[sender] = sender_name
                     participants.add(sender)
-                if subj:
+                if subj and is_relevant_topic(subj):
                     if subj not in topic_data:
                         topic_data[subj] = {'conv_ids': set(), 'message_count': 0}
                     topic_data[subj]['conv_ids'].add(conv_id)
@@ -808,13 +878,15 @@ class RAGEngine:
 
         for e in standalone:
             meta = e.get('metadata', {})
-            sender = meta.get('sender', '')
-            sender_name = meta.get('sender_name') or sender
+            sender = norm_email(meta.get('sender', ''))
+            sender_name = meta.get('sender_name') or meta.get('sender', '')
             subj = normalize_subject(meta.get('subject', ''))
-            if sender:
+            is_meeting = meta.get('email_type') == 'meeting_note'
+            if sender and not is_meeting:
                 person_email_counts[sender] = person_email_counts.get(sender, 0) + 1
-                person_names[sender] = sender_name
-            if subj:
+                if sender_name and (sender not in person_names or person_names[sender] == sender):
+                    person_names[sender] = sender_name
+            if subj and is_relevant_topic(subj):
                 if subj not in topic_data:
                     topic_data[subj] = {'conv_ids': set(), 'message_count': 0}
                 topic_data[subj]['message_count'] += 1
@@ -876,7 +948,7 @@ class RAGEngine:
 
         for e in emails_with_threads:
             meta = e.get('metadata', {})
-            sender = meta.get('sender', '')
+            sender = norm_email(meta.get('sender', ''))
             body = e.get('document', '')
             if not sender or not body:
                 continue
@@ -978,7 +1050,7 @@ class RAGEngine:
         person_topic_threads = defaultdict(lambda: {'count': 0, 'thread_ids': []})
         for e in emails_with_threads:
             meta = e.get('metadata', {})
-            sender = meta.get('sender', '')
+            sender = norm_email(meta.get('sender', ''))
             subj = normalize_subject(meta.get('subject', ''))
             conv_id = meta.get('conversation_id', '')
             if sender and subj and f"topic_{subj}" in node_ids:

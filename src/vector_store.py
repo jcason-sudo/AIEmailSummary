@@ -9,6 +9,7 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 import config
+from email_preprocessor import chunk_email, generate_thread_summary_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -38,33 +39,64 @@ class EmailVectorStore:
         return self._embedder.encode(texts, convert_to_numpy=True).tolist()
         
     def add_emails(self, emails: List[Any], batch_size: int = 100) -> int:
-        """Add emails to the store. Returns count added."""
+        """Add emails to the store with smart chunking.
+
+        Each email is segmented into chunks:
+        - "fresh" chunk: newest message content (boilerplate stripped)
+        - "quoted" chunk: reply history (if substantial)
+
+        Returns count of emails processed (each may produce multiple chunks).
+        """
         added = 0
-        
+
         for i in range(0, len(emails), batch_size):
             batch = emails[i:i + batch_size]
-            
+
             ids = []
             documents = []
             metadatas = []
-            
+            seen_ids = set()  # Track IDs within this batch to avoid duplicates
+
             for email in batch:
-                doc_id = email.unique_id
-                
-                # Skip duplicates
-                existing = self._collection.get(ids=[doc_id])
-                if existing['ids']:
+                base_id = email.unique_id
+
+                # Skip if already seen in this batch
+                fresh_id = f"{base_id}_fresh"
+                if fresh_id in seen_ids:
                     continue
-                    
-                ids.append(doc_id)
-                documents.append(email.to_document())
-                metadatas.append(email.to_metadata())
-            
+
+                # Skip if any chunk from this email already exists in DB
+                try:
+                    existing = self._collection.get(ids=[fresh_id])
+                    if existing['ids']:
+                        continue
+                except Exception:
+                    pass
+                # Also check legacy (pre-chunking) ID for backward compat
+                try:
+                    existing = self._collection.get(ids=[base_id])
+                    if existing['ids']:
+                        continue
+                except Exception:
+                    pass
+
+                # Chunk the email
+                document = email.to_document()
+                metadata = email.to_metadata()
+                chunks = chunk_email(base_id, document, metadata)
+
+                for chunk in chunks:
+                    if chunk.chunk_id not in seen_ids:
+                        ids.append(chunk.chunk_id)
+                        documents.append(chunk.text)
+                        metadatas.append(chunk.metadata)
+                        seen_ids.add(chunk.chunk_id)
+
             if not ids:
                 continue
-                
+
             embeddings = self._embed(documents)
-            
+
             self._collection.add(
                 ids=ids,
                 embeddings=embeddings,
@@ -72,8 +104,79 @@ class EmailVectorStore:
                 metadatas=metadatas
             )
             added += len(ids)
-            
+            logger.info(f"Batch: added {len(ids)} chunks from {len(batch)} emails")
+
         return added
+
+    def add_thread_summaries(self) -> int:
+        """Generate and store thread summary chunks for all conversation threads.
+
+        Call after ingestion to create summary chunks that capture thread arcs.
+        """
+        total = self._collection.count()
+        if total == 0:
+            return 0
+
+        results = self._collection.get(
+            include=["documents", "metadatas"],
+            limit=min(total, 10000)
+        )
+
+        # Group by conversation_id
+        threads = {}
+        for i in range(len(results['ids'])):
+            meta = results['metadatas'][i] if results['metadatas'] else {}
+            conv_id = meta.get('conversation_id', '')
+            if conv_id:
+                threads.setdefault(conv_id, []).append({
+                    'id': results['ids'][i],
+                    'document': results['documents'][i] if results['documents'] else '',
+                    'metadata': meta,
+                })
+
+        ids = []
+        documents = []
+        metadatas = []
+        generated = 0
+
+        for conv_id, thread_emails in threads.items():
+            if len(thread_emails) < 2:
+                continue
+
+            # Use latest email's metadata as template
+            sorted_emails = sorted(thread_emails, key=lambda e: e.get('metadata', {}).get('date', ''))
+            template_meta = sorted_emails[-1].get('metadata', {})
+
+            chunk = generate_thread_summary_chunk(conv_id, thread_emails, template_meta)
+            if not chunk:
+                continue
+
+            # Skip if already exists
+            try:
+                existing = self._collection.get(ids=[chunk.chunk_id])
+                if existing['ids']:
+                    continue
+            except Exception:
+                pass
+
+            ids.append(chunk.chunk_id)
+            documents.append(chunk.text)
+            metadatas.append(chunk.metadata)
+            generated += 1
+
+            # Batch insert every 100
+            if len(ids) >= 100:
+                embeddings = self._embed(documents)
+                self._collection.add(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+                ids, documents, metadatas = [], [], []
+
+        # Final batch
+        if ids:
+            embeddings = self._embed(documents)
+            self._collection.add(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+
+        logger.info(f"Generated {generated} thread summary chunks from {len(threads)} threads")
+        return generated
         
     def search(self,
                query: str,
@@ -140,97 +243,22 @@ class EmailVectorStore:
         return emails
 
     def get_open_items(self) -> List[Dict[str, Any]]:
-        """Get open email threads by analyzing the last message in each conversation.
+        """Get open email threads using the deterministic state engine.
 
-        Thread status is determined by WHO sent the last message:
-        - Last message is RECEIVED + not replied → needs_action (you owe a reply)
-        - Last message is SENT → awaiting_response (they owe you a reply)
-        - Last message is RECEIVED + replied → completed
-
-        This does NOT rely on is_replied for sent emails (which is always False
-        since you don't reply to your own sent mail). Instead it looks at the
-        actual conversation timeline.
+        Delegates to ThreadStateEngine which uses known user email addresses
+        to accurately classify thread status.
         """
-        # Get ALL emails to build complete thread picture
-        try:
-            total = self._collection.count()
-            if total == 0:
-                return []
-            results = self._collection.get(
-                include=["metadatas"],
-                limit=min(total, 5000)
-            )
-        except Exception as e:
-            logger.warning(f"Open items query failed: {e}")
-            return []
+        from state_engine import get_state_engine
+        engine = get_state_engine()
+        states = engine.get_all_thread_states(self)
 
-        # Group by conversation_id
-        threads = {}  # conv_id -> list of metadata dicts
-        standalone = []
-        for i in range(len(results['ids'])):
-            meta = results['metadatas'][i] if results['metadatas'] else {}
-            meta['_id'] = results['ids'][i]
-            conv_id = meta.get('conversation_id', '')
-            if conv_id:
-                threads.setdefault(conv_id, []).append(meta)
-            else:
-                # Standalone received + not replied = needs action
-                if meta.get('direction') == 'received' and not meta.get('is_replied'):
-                    standalone.append(meta)
-
-        # Analyze each thread
+        # Combine needs_action + awaiting_response + stale into a flat list
         open_items = []
-        for conv_id, messages in threads.items():
-            # Sort by date to find the last message
-            messages.sort(key=lambda m: m.get('date', ''))
-            latest = messages[-1]
+        open_items.extend(states.get('needs_action', []))
+        open_items.extend(states.get('awaiting_response', []))
+        open_items.extend(states.get('stale', []))
 
-            last_direction = latest.get('direction', 'received')
-            last_replied = latest.get('is_replied', False)
-
-            # Determine thread status based on who sent the last message
-            if last_direction == 'received' and not last_replied:
-                status = 'needs_action'
-            elif last_direction == 'sent':
-                # I sent the last message — check if anyone replied after
-                # (if my sent is the latest, they haven't responded)
-                status = 'awaiting_response'
-            elif last_direction == 'received' and last_replied:
-                status = 'completed'
-            else:
-                status = 'completed'
-
-            # Skip completed threads
-            if status == 'completed':
-                continue
-
-            open_items.append({
-                'conversation_id': conv_id,
-                'subject': latest.get('subject', ''),
-                'sender': latest.get('sender', ''),
-                'sender_name': latest.get('sender_name', ''),
-                'date': latest.get('date', ''),
-                'message_count': len(messages),
-                'status': status,
-                'participants': list(set(
-                    m.get('sender', '') for m in messages if m.get('sender')
-                ))
-            })
-
-        # Add standalone emails (no conversation_id, received, not replied)
-        for meta in standalone:
-            open_items.append({
-                'conversation_id': '',
-                'subject': meta.get('subject', ''),
-                'sender': meta.get('sender', ''),
-                'sender_name': meta.get('sender_name', ''),
-                'date': meta.get('date', ''),
-                'message_count': 1,
-                'status': 'needs_action',
-                'participants': [meta.get('sender', '')]
-            })
-
-        # Sort by date descending (newest first)
+        # Sort by date descending
         open_items.sort(key=lambda x: x['date'], reverse=True)
         return open_items
 
@@ -351,6 +379,86 @@ class EmailVectorStore:
             'hourly_distribution': hourly,
             'folder_distribution': folder_dist,
         }
+
+    def update_email_metadata(self, email_unique_id: str, metadata_updates: dict) -> int:
+        """Update metadata on existing chunks for an email without re-embedding.
+
+        Finds all chunks matching the email's unique_id prefix and updates
+        their metadata fields.
+
+        Returns count of chunks updated.
+        """
+        # Chunk IDs follow the pattern: {unique_id}_fresh, {unique_id}_quoted, etc.
+        # Find all chunks for this email
+        suffixes = ['_fresh', '_quoted', '_f0', '_f1', '_f2', '_q0', '_q1']
+        chunk_ids = [f"{email_unique_id}{s}" for s in suffixes]
+        # Also check attachment chunks (_att0, _att1, etc.)
+        for i in range(10):
+            chunk_ids.append(f"{email_unique_id}_att{i}")
+
+        updated = 0
+        try:
+            existing = self._collection.get(ids=chunk_ids, include=["metadatas"])
+            for i, chunk_id in enumerate(existing['ids']):
+                meta = existing['metadatas'][i].copy()
+                meta.update(metadata_updates)
+                self._collection.update(
+                    ids=[chunk_id],
+                    metadatas=[meta],
+                )
+                updated += 1
+        except Exception as e:
+            logger.debug(f"Error updating metadata for {email_unique_id}: {e}")
+
+        return updated
+
+    def cleanup_old_emails(self, retention_days: int) -> int:
+        """Delete documents with date metadata older than retention window.
+
+        Returns count of deleted documents.
+        """
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
+
+        total = self._collection.count()
+        if total == 0:
+            return 0
+
+        # Query in batches to find old documents
+        deleted = 0
+        batch_size = 1000
+        offset = 0
+
+        while offset < total:
+            results = self._collection.get(
+                include=["metadatas"],
+                limit=batch_size,
+                offset=offset,
+            )
+            if not results['ids']:
+                break
+
+            old_ids = []
+            for i, meta in enumerate(results['metadatas']):
+                date_str = meta.get('date', '')
+                if date_str and date_str < cutoff:
+                    old_ids.append(results['ids'][i])
+
+            if old_ids:
+                # Delete in sub-batches (ChromaDB limit)
+                for j in range(0, len(old_ids), 500):
+                    batch_ids = old_ids[j:j + 500]
+                    self._collection.delete(ids=batch_ids)
+                    deleted += len(batch_ids)
+                # Don't advance offset since we deleted items
+                total = self._collection.count()
+            else:
+                offset += batch_size
+
+        if deleted:
+            logger.info(f"Retention cleanup: deleted {deleted} old chunks (>{retention_days} days)")
+
+        return deleted
 
     def clear(self):
         """Clear all emails."""

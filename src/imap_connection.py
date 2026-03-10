@@ -12,7 +12,8 @@ from datetime import datetime, timedelta
 from typing import Generator, Optional, List, Dict
 import html2text
 
-from models import EmailMessage, EmailDirection
+from models import EmailMessage, EmailDirection, EmailAttachment
+from attachment_extractor import can_extract, MAX_ATTACHMENT_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -326,14 +327,31 @@ class IMAPConnection:
             else:
                 direction = EmailDirection.RECEIVED
 
-            # Attachments
+            # Attachments — extract content for supported types
+            attachments = []
             has_attachments = False
             if msg.is_multipart():
                 for part in msg.walk():
                     disposition = str(part.get('Content-Disposition', ''))
-                    if 'attachment' in disposition:
-                        has_attachments = True
-                        break
+                    if 'attachment' not in disposition:
+                        continue
+                    has_attachments = True
+                    filename = part.get_filename() or ''
+                    if filename:
+                        filename = _decode_header(filename)
+                    content_type = part.get_content_type() or ''
+                    if can_extract(content_type, filename):
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload and len(payload) <= MAX_ATTACHMENT_SIZE:
+                                attachments.append(EmailAttachment(
+                                    filename=filename,
+                                    size_bytes=len(payload),
+                                    content_type=content_type,
+                                    content=payload,
+                                ))
+                        except Exception:
+                            pass
 
             # Importance
             importance = 'normal'
@@ -347,6 +365,10 @@ class IMAPConnection:
                         importance = 'low'
                 except Exception:
                     pass
+
+            # Detect automated/bot senders
+            import config as _cfg
+            email_type = "meeting_note" if sender_email.lower() in _cfg.AUTOMATED_SENDERS else ""
 
             return EmailMessage(
                 message_id=message_id,
@@ -369,6 +391,8 @@ class IMAPConnection:
                 references=references,
                 has_attachments=has_attachments,
                 importance=importance,
+                attachments=attachments,
+                email_type=email_type,
             )
 
         except Exception as e:

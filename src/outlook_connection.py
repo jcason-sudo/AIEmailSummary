@@ -10,7 +10,8 @@ from typing import Generator, Optional, List
 from bs4 import BeautifulSoup
 import html2text
 
-from models import EmailMessage, EmailDirection
+from models import EmailMessage, EmailDirection, EmailAttachment
+from attachment_extractor import can_extract, MAX_ATTACHMENT_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -294,13 +295,40 @@ class OutlookConnection:
             except:
                 pass
                 
-            # Attachments
+            # Attachments — extract content for supported types
+            attachments = []
             has_attachments = False
             try:
-                has_attachments = mail_item.Attachments.Count > 0
-            except:
+                att_count = mail_item.Attachments.Count
+                has_attachments = att_count > 0
+                if has_attachments:
+                    import tempfile
+                    from pathlib import Path as _Path
+                    for i in range(1, att_count + 1):  # COM is 1-indexed
+                        try:
+                            att = mail_item.Attachments.Item(i)
+                            filename = att.FileName or ''
+                            if can_extract('', filename):
+                                tmp = tempfile.mktemp(suffix='_' + filename)
+                                att.SaveAsFile(tmp)
+                                content = _Path(tmp).read_bytes()
+                                _Path(tmp).unlink(missing_ok=True)
+                                if len(content) <= MAX_ATTACHMENT_SIZE:
+                                    attachments.append(EmailAttachment(
+                                        filename=filename,
+                                        size_bytes=len(content),
+                                        content_type='',
+                                        content=content,
+                                    ))
+                        except Exception:
+                            continue
+            except Exception:
                 pass
-                
+
+            # Detect automated/bot senders
+            import config as _cfg
+            email_type = "meeting_note" if sender.lower() in _cfg.AUTOMATED_SENDERS else ""
+
             return EmailMessage(
                 message_id=message_id,
                 conversation_id=conversation_id,
@@ -323,6 +351,8 @@ class OutlookConnection:
                 is_flagged=is_flagged,
                 importance=importance,
                 has_attachments=has_attachments,
+                attachments=attachments,
+                email_type=email_type,
             )
             
         except Exception as e:

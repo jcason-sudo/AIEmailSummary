@@ -225,8 +225,6 @@ class InboxAI {
             // Load data for specific views
             if (viewName === 'dashboard') {
                 this.loadDashboard();
-            } else if (viewName === 'tasks') {
-                this.loadTasks();
             } else if (viewName === 'meetings') {
                 this.loadMeetings();
             } else if (viewName === 'settings') {
@@ -718,13 +716,12 @@ class InboxAI {
     }
 
     async prepareMeeting(index, title) {
-        this.meetingPrepContainer.style.display = 'block';
+        // Show modal overlay
+        const overlay = document.getElementById('meeting-prep-overlay');
+        overlay.style.display = 'flex';
         this.prepMeetingTitle.textContent = `Prep: ${title}`;
         this.meetingPrepContent.innerHTML = '<div class="loading-placeholder">Generating prep brief...</div>';
         this.meetingPrepSources.innerHTML = '';
-
-        // Scroll to prep container
-        this.meetingPrepContainer.scrollIntoView({ behavior: 'smooth' });
 
         try {
             const response = await fetch(`${this.apiBase}/api/meetings/${index}/prep?stream=true`);

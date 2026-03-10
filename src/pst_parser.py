@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 import html2text
 
 from models import EmailMessage, EmailDirection, EmailAttachment
+from attachment_extractor import can_extract, MAX_ATTACHMENT_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -175,14 +176,35 @@ class PSTParser:
             message_flags = getattr(message, 'message_flags', 0) or 0
             is_read = bool(message_flags & 0x0001) if isinstance(message_flags, int) else False
             
-            # Attachments
+            # Attachments — extract content for supported types
             num_attachments = getattr(message, 'number_of_attachments', 0) or 0
             has_attachments = num_attachments > 0
-            
+            attachments = []
+            for att_idx in range(num_attachments):
+                try:
+                    att = message.get_attachment(att_idx)
+                    filename = getattr(att, 'name', '') or f'attachment_{att_idx}'
+                    size = getattr(att, 'size', 0) or 0
+                    if can_extract('', filename) and size <= MAX_ATTACHMENT_SIZE:
+                        content = att.read_buffer(size)
+                        if content:
+                            attachments.append(EmailAttachment(
+                                filename=filename,
+                                size_bytes=size,
+                                content_type='',
+                                content=content,
+                            ))
+                except Exception:
+                    continue
+
             # Conversation/threading
             conversation_id = getattr(message, 'conversation_topic', '') or ''
             in_reply_to = getattr(message, 'in_reply_to_id', '') or ''
             
+            # Detect automated/bot senders
+            import config as _cfg
+            email_type = "meeting_note" if sender.lower() in _cfg.AUTOMATED_SENDERS else ""
+
             return EmailMessage(
                 message_id=message_id,
                 conversation_id=conversation_id,
@@ -202,6 +224,8 @@ class PSTParser:
                 is_read=is_read,
                 has_attachments=has_attachments,
                 in_reply_to=in_reply_to,
+                attachments=attachments,
+                email_type=email_type,
             )
             
         except Exception as e:

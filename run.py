@@ -29,17 +29,19 @@ logger = logging.getLogger(__name__)
 def run_ingestion(args):
     """Run email ingestion."""
     from ingestion import run_ingestion as do_ingestion
-    
+
     logger.info("Starting email ingestion...")
-    
+
     pst_paths = [Path(p.strip()) for p in args.pst.split(',') if p.strip()] if args.pst else None
-    
+
     stats = do_ingestion(
         pst_paths=pst_paths,
         include_outlook=not args.no_outlook,
-        days_back=args.days
+        days_back=args.days,
+        full_sync=args.full_sync,
+        retention_days=args.retention_days,
     )
-    
+
     logger.info(f"Ingestion complete: {stats}")
     return stats
 
@@ -86,6 +88,17 @@ def main():
         type=int,
         default=config.EMAIL_LOOKBACK_DAYS,
         help='Days of email history to ingest'
+    )
+    parser.add_argument(
+        '--full-sync',
+        action='store_true',
+        help='Force full re-scan, ignoring watermarks (default: incremental)'
+    )
+    parser.add_argument(
+        '--retention-days',
+        type=int,
+        default=None,
+        help=f'Delete emails older than N days (default: {config.EMAIL_RETENTION_DAYS})'
     )
     parser.add_argument(
         '--host',

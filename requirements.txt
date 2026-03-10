@@ -15,9 +15,18 @@ sentence-transformers>=2.2.2
 # HTTP (for Ollama API)
 httpx>=0.26.0
 
+# Hybrid retrieval
+rank-bm25>=0.2.2
+
 # Text processing
 beautifulsoup4>=4.12.3
 html2text>=2024.2.26
+
+# Attachment text extraction
+PyPDF2>=3.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+python-pptx>=0.6.23
 
 # Claude API (optional)
 anthropic>=0.40.0

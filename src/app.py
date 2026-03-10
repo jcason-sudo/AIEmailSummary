@@ -233,6 +233,85 @@ def entity_map():
     return jsonify(result)
 
 
+@app.route('/api/extract', methods=['POST'])
+def extract():
+    """Extract fact cards from unprocessed emails using Claude."""
+    data = request.json or {}
+    limit = data.get('limit', 500)
+
+    try:
+        from fact_extractor import run_extraction
+        result = run_extraction(limit=limit)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Extraction error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/facts/stats')
+def fact_stats():
+    """Get fact card extraction statistics."""
+    try:
+        from fact_store import get_fact_store
+        store = get_fact_store()
+        return jsonify(store.get_stats())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/facts/commitments')
+def fact_commitments():
+    """Get extracted commitments, optionally filtered by person."""
+    person = request.args.get('person')
+    try:
+        from fact_store import get_fact_store
+        store = get_fact_store()
+        return jsonify({'commitments': store.get_commitments(person=person)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/facts/actions')
+def fact_actions():
+    """Get extracted action items, optionally filtered by assignee."""
+    assignee = request.args.get('assignee')
+    try:
+        from fact_store import get_fact_store
+        store = get_fact_store()
+        return jsonify({'action_items': store.get_action_items(assignee=assignee)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sync/status')
+def sync_status():
+    """Get sync watermarks and overall sync stats."""
+    try:
+        from sync_state import get_sync_state
+        sync = get_sync_state()
+        return jsonify({
+            'watermarks': sync.get_all_watermarks(),
+            'stats': sync.get_stats(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sync/history')
+def sync_history():
+    """Get recent sync history log."""
+    account = request.args.get('account')
+    limit = request.args.get('limit', 20, type=int)
+    try:
+        from sync_state import get_sync_state
+        sync = get_sync_state()
+        return jsonify({
+            'history': sync.get_sync_history(account_id=account, limit=limit),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/analytics')
 def analytics():
     """Get email analytics for charts."""
@@ -363,24 +442,42 @@ def debug_query():
 @app.route('/api/email/open', methods=['POST'])
 def open_email():
     """Open an email in Outlook or return a web link for IMAP-sourced emails."""
+    import urllib.parse
+
     data = request.json or {}
     message_id = data.get('message_id', '')
     subject = data.get('subject', '')
     sender = data.get('sender', '')
     source = data.get('source', '')
 
-    # For IMAP-sourced emails, return a web link instead
-    if source in ('gmail', 'yahoo'):
-        if source == 'gmail':
-            # Gmail search URL
-            import urllib.parse
-            query = urllib.parse.quote(f'subject:"{subject}" from:{sender}' if sender else f'subject:"{subject}"')
+    # For IMAP-sourced emails, return a web link
+    if source == 'gmail':
+        # Build search using subject + from for reliable Gmail web search
+        parts = []
+        if subject:
+            # Escape quotes in subject, truncate to avoid URL issues
+            clean_subj = subject[:80].replace('"', '')
+            parts.append(f'subject:"{clean_subj}"')
+        if sender:
+            parts.append(f'from:{sender}')
+        query = urllib.parse.quote(' '.join(parts)) if parts else ''
+        if query:
             return jsonify({'status': 'web', 'url': f'https://mail.google.com/mail/u/0/#search/{query}'})
-        elif source == 'yahoo':
-            import urllib.parse
-            query = urllib.parse.quote(subject or '')
-            return jsonify({'status': 'web', 'url': f'https://mail.yahoo.com/d/search/keyword={query}'})
+        return jsonify({'error': 'No search criteria available'}), 400
 
+    if source == 'yahoo':
+        # Yahoo search — use subject + sender for best match
+        parts = []
+        if subject:
+            parts.append(subject)
+        if sender:
+            parts.append(sender)
+        query = urllib.parse.quote(' '.join(parts)) if parts else ''
+        if query:
+            return jsonify({'status': 'web', 'url': f'https://mail.yahoo.com/d/search/keyword={query}'})
+        return jsonify({'error': 'No search criteria available'}), 400
+
+    # Outlook — open via COM
     if not OUTLOOK_AVAILABLE:
         return jsonify({'error': 'Outlook not available'}), 400
 
@@ -393,29 +490,33 @@ def open_email():
 
         mail_item = None
 
-        # Try EntryID first
+        # Method 1: Try EntryID lookup (works if message_id is an EntryID)
         if message_id:
             try:
                 mail_item = namespace.GetItemFromID(message_id)
             except Exception:
-                logger.debug(f"EntryID lookup failed for {message_id[:20]}...")
+                logger.debug(f"EntryID lookup failed for {message_id[:30]}...")
 
-        # Fallback: search by subject in all default folders + subfolders
-        if mail_item is None and subject:
-            safe_subject = subject.replace("'", "''")
-            # Search Inbox, Sent, and all configured folders
-            for folder_id in [6, 5]:  # Inbox=6, Sent=5
+        # Method 2: Search by Internet Message-ID using DASL filter
+        if mail_item is None and message_id:
+            dasl_filter = (
+                f"@SQL=\"urn:schemas:mailheader:message-id\" = '{message_id}'"
+                if '<' not in message_id else
+                f"@SQL=\"urn:schemas:mailheader:message-id\" = '<{message_id}>'"
+                if not message_id.startswith('<') else
+                f"@SQL=\"urn:schemas:mailheader:message-id\" = '{message_id}'"
+            )
+            for folder_id in [6, 5]:  # Inbox, Sent
                 try:
                     folder = namespace.GetDefaultFolder(folder_id)
-                    items = folder.Items
-                    items = items.Restrict(f"[Subject] = '{safe_subject}'")
+                    items = folder.Items.Restrict(dasl_filter)
                     if items.Count > 0:
                         mail_item = items.GetFirst()
                         break
                 except Exception:
                     continue
 
-            # Also search subfolders by name from config
+            # Also search configured folders
             if mail_item is None:
                 for folder_name in config.OUTLOOK_FOLDERS:
                     try:
@@ -423,8 +524,7 @@ def open_email():
                             root = store.GetRootFolder()
                             folder = _find_folder(root, folder_name)
                             if folder:
-                                items = folder.Items
-                                items = items.Restrict(f"[Subject] = '{safe_subject}'")
+                                items = folder.Items.Restrict(dasl_filter)
                                 if items.Count > 0:
                                     mail_item = items.GetFirst()
                                     break
@@ -432,6 +532,42 @@ def open_email():
                             break
                     except Exception:
                         continue
+
+        # Method 3: Fallback — search by subject (use LIKE for partial matches)
+        if mail_item is None and subject:
+            safe_subject = subject.replace("'", "''").replace('"', '""')
+            # Try exact match first, then LIKE
+            for restrict_expr in [
+                f"[Subject] = '{safe_subject}'",
+                f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{safe_subject}%'",
+            ]:
+                if mail_item:
+                    break
+                for folder_id in [6, 5]:
+                    try:
+                        folder = namespace.GetDefaultFolder(folder_id)
+                        items = folder.Items.Restrict(restrict_expr)
+                        if items.Count > 0:
+                            mail_item = items.GetFirst()
+                            break
+                    except Exception:
+                        continue
+
+                if mail_item is None:
+                    for folder_name in config.OUTLOOK_FOLDERS:
+                        try:
+                            for store in namespace.Stores:
+                                root = store.GetRootFolder()
+                                folder = _find_folder(root, folder_name)
+                                if folder:
+                                    items = folder.Items.Restrict(restrict_expr)
+                                    if items.Count > 0:
+                                        mail_item = items.GetFirst()
+                                        break
+                            if mail_item:
+                                break
+                        except Exception:
+                            continue
 
         if mail_item:
             mail_item.Display()

@@ -67,7 +67,8 @@ class EmailMessage:
     is_forwarded: bool = False
     is_flagged: bool = False
     importance: str = "normal"
-    
+    email_type: str = ""  # "meeting_note" for Zoom/bot emails, "" for normal
+
     # Thread info
     in_reply_to: Optional[str] = None
     references: List[str] = field(default_factory=list)
@@ -98,7 +99,10 @@ class EmailMessage:
     def to_document(self) -> str:
         """Convert to a searchable document string."""
         parts = []
-        
+
+        if self.email_type == "meeting_note":
+            parts.append("[Meeting Summary]")
+
         # Add metadata
         if self.sender:
             parts.append(f"From: {self.sender_name or self.sender}")
@@ -110,9 +114,9 @@ class EmailMessage:
             parts.append(f"Date: {self.date.strftime('%Y-%m-%d %H:%M')}")
         if self.folder:
             parts.append(f"Folder: {self.folder}")
-            
+
         parts.append("")  # Blank line
-        
+
         # Add body
         body = self.body_text or ""
         if body:
@@ -120,7 +124,17 @@ class EmailMessage:
             if len(body) > 5000:
                 body = body[:5000] + "..."
             parts.append(body)
-            
+
+        # Add extracted attachment text
+        if self.attachments:
+            from attachment_extractor import extract_text
+            for att in self.attachments:
+                if att.content:
+                    text = extract_text(att.filename, att.content, att.content_type)
+                    if text:
+                        parts.append(f"\n[Attachment: {att.filename}]")
+                        parts.append(text[:3000])
+
         return "\n".join(parts)
     
     def to_metadata(self) -> dict:
@@ -141,6 +155,8 @@ class EmailMessage:
             "is_flagged": self.is_flagged,
             "has_attachments": self.has_attachments,
             "importance": self.importance,
+            "email_type": self.email_type,
+            "attachment_names": ",".join(a.filename for a in self.attachments[:10] if a.filename),
         }
     
     @classmethod
